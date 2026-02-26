@@ -1,0 +1,29 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "runClient",
+      "type": "shell",
+      "command": "./gradlew runClient",
+      "windows": { "command": ".\\gradlew.bat runClient" },
+      "group": "build",
+      "presentation": { "reveal": "always", "panel": "new" }
+    },
+    {
+      "label": "genSources",
+      "type": "shell",
+      "command": "./gradlew genSources",
+      "windows": { "command": ".\\gradlew.bat genSources" },
+      "group": "build",
+      "presentation": { "reveal": "always" }
+    },
+    {
+      "label": "build",
+      "type": "shell",
+      "command": "./gradlew build",
+      "windows": { "command": ".\\gradlew.bat build" },
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "reveal": "always" }
+    }
+  ]
+}

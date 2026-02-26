@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "beamqueue",
+  "version": "${version}",
+  "name": "Beam Queue",
+  "description": "Client-side mod that automates queuing for sword PvP and messaging nearby players for 2v2 tournaments.",
+  "authors": [],
+  "contact": {},
+  "license": "CC0-1.0",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "net.samar.beamqueue.BeamQueueMod"
+    ]
+  },
+  "mixins": [
+    "beamqueue.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.7",
+    "fabric-api": "*",
+    "minecraft": "~1.21.4",
+    "java": ">=21"
+  },
+  "custom": {
+    "modmenu": {
+      "clientSideOnly": true
+    }
+  }
+}
