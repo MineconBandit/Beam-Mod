@@ -3,7 +3,7 @@
 # Or set env BEAMQUEUE_API_KEY or BEAMQUEUE_OPENAI_API_KEY.
 
 # g4f API endpoint used by default in code.
-api_url=https://g4f.space/api/auto/chat/completions
+api_url=https://g4f.space/api/ollama/chat/completions
 api_key=your-g4f-api-key-here
 # Default model in code is empty (provider auto-select). Optional:
 # model=

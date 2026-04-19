@@ -380,6 +380,34 @@ public class BeamQueueMod implements ClientModInitializer {
             );
 
             dispatcher.register(
+                ClientCommandManager.literal("apiurl")
+                    .then(ClientCommandManager.argument("url", StringArgumentType.greedyString()).executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        String url = sanitizeCommandValue(StringArgumentType.getString(ctx, "url"));
+                        if (url.isBlank()) {
+                            client.player.sendMessage(Text.literal("Usage: /apiurl <base-url>").formatted(Formatting.GREEN), false);
+                            return 0;
+                        }
+                        boolean saved = BeamQueueConfig.setApiUrl(url);
+                        BeamQueueAiReply.triggerHealthCheckNow();
+                        if (saved) {
+                            client.player.sendMessage(Text.literal("API base URL set to: " + BeamQueueConfig.getApiUrl()).formatted(Formatting.GREEN), false);
+                        } else {
+                            client.player.sendMessage(Text.literal("API base URL set for now, but failed to save config file.").formatted(Formatting.GREEN), false);
+                        }
+                        BeamQueueLog.info("AI API URL updated via /apiurl command: {}", url);
+                        return 1;
+                    }))
+                    .executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        client.player.sendMessage(Text.literal("Current API base URL: " + BeamQueueConfig.getApiUrl()).formatted(Formatting.GREEN), false);
+                        return 1;
+                    })
+            );
+
+            dispatcher.register(
                 ClientCommandManager.literal("checkai")
                     .executes(ctx -> {
                         MinecraftClient client = MinecraftClient.getInstance();

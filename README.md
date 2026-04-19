@@ -99,7 +99,7 @@ AI handles non-yes/non-decline target replies.
 - HUD status is shown in top-left
 - Health checks run automatically
 - Temporary API issues do not instantly flip to red status
-- Default AI endpoint is `https://g4f.space/api/auto/chat/completions`
+- Default AI endpoint is `https://g4f.space/api/ollama/chat/completions`
 - AI requests are sent with no API key and no model by default
 
 ### <u>API Key (Optional)</u>

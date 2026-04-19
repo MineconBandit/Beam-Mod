@@ -9,7 +9,7 @@ import java.util.Properties;
 
 /**
  * Loads API key and base URL from config/beamqueue.properties or env.
- * Default API URL: https://g4f.space/api/auto/chat/completions
+ * Default API URL: https://g4f.space/api/ollama/chat/completions
  * Env: BEAMQUEUE_API_KEY or BEAMQUEUE_OPENAI_API_KEY.
  */
 public final class BeamQueueConfig {
@@ -22,8 +22,8 @@ public final class BeamQueueConfig {
     private static final String KEY_OPENAI_API_URL = "openai_api_url";
     private static final String KEY_MODEL = "model";
     private static final String KEY_DEBUG = "debug";
-    /** g4f.space auto provider endpoint. */
-    private static final String DEFAULT_API_URL = "https://g4f.space/api/auto/chat/completions";
+    /** g4f.space ollama provider endpoint. */
+    private static final String DEFAULT_API_URL = "https://g4f.space/api/ollama/chat/completions";
     /** Empty by default so provider auto-selects model unless user sets one. */
     private static final String DEFAULT_MODEL = "";
     /** Hardcoded g4f.dev API key (override with config or env if needed). */
@@ -69,6 +69,14 @@ public final class BeamQueueConfig {
         ensureLoaded();
         model = normalized;
         return saveModelToConfig(normalized);
+    }
+
+    public static synchronized boolean setApiUrl(String newApiUrl) {
+        String normalized = newApiUrl == null ? "" : newApiUrl.trim();
+        if (normalized.isBlank()) return false;
+        ensureLoaded();
+        apiUrl = normalized;
+        return saveApiUrlToConfig(normalized);
     }
 
     private static void ensureLoaded() {
@@ -144,6 +152,30 @@ public final class BeamQueueConfig {
             return true;
         } catch (IOException e) {
             BeamQueueLog.warn("Failed writing model to config: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    private static boolean saveApiUrlToConfig(String url) {
+        Path configPath = getConfigPath();
+        Properties p = new Properties();
+        if (Files.isRegularFile(configPath)) {
+            try (var in = Files.newInputStream(configPath)) {
+                p.load(in);
+            } catch (IOException e) {
+                BeamQueueLog.warn("Failed reading existing config before writing api_url: {}", e.getMessage());
+            }
+        }
+        p.setProperty(KEY_API_URL, url);
+        p.remove(KEY_OPENAI_API_URL);
+        try {
+            Files.createDirectories(configPath.getParent());
+            try (var out = Files.newOutputStream(configPath)) {
+                p.store(out, "Beam Queue config");
+            }
+            return true;
+        } catch (IOException e) {
+            BeamQueueLog.warn("Failed writing api_url to config: {}", e.getMessage());
             return false;
         }
     }

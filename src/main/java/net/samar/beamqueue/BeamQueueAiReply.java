@@ -6,6 +6,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.concurrent.ExecutorService;
@@ -21,8 +22,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Event info: in 20 mins, configurable server IP, ~50 players, Discord donutskelesz.
  */
 public final class BeamQueueAiReply {
-
-    private static final String AUTO_API_URL = "https://g4f.space/api/auto/chat/completions";
 
     private static final ExecutorService EXECUTOR = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "beamqueue-ai");
@@ -49,6 +48,7 @@ public final class BeamQueueAiReply {
     private static final int MAX_RETRIES = 5;
     private static final int RETRY_BASE_DELAY_MS = 2000;
     private static final int RETRY_MAX_DELAY_MS = 12000;
+    private static final int REQUEST_TIMEOUT_SEC = 35;
     private static final long MIN_API_CALL_GAP_MS = 3000L;
     private static final int HEALTH_CHECK_INITIAL_DELAY_SEC = 5;
     private static final int HEALTH_CHECK_INTERVAL_SEC = 120;
@@ -130,6 +130,10 @@ public final class BeamQueueAiReply {
                 AiIntent intent = extractIntent(raw, userMessage);
                 String parsedReply = extractReplyText(raw);
                 if (parsedReply == null || parsedReply.isBlank()) {
+                    parsedReply = getFallbackReply(userMessage);
+                }
+                if (looksLikeAiRefusal(parsedReply)) {
+                    BeamQueueLog.warn("AI refusal-like output detected; switching to fallback reply");
                     parsedReply = getFallbackReply(userMessage);
                 }
                 String toSend = ensureVariedReply(sanitizeForChat(parsedReply), userMessage);
@@ -223,7 +227,7 @@ public final class BeamQueueAiReply {
     }
 
     private static String callApi(String userMessage, int maxRetries) throws Exception {
-        String url = AUTO_API_URL;
+        String url = BeamQueueConfig.getApiUrl();
         String systemPrompt = buildSystemPrompt();
         enforceApiGap();
         String body = "{\"messages\":[" +
@@ -243,12 +247,24 @@ public final class BeamQueueAiReply {
             .header("sec-fetch-dest", "empty")
             .header("sec-fetch-mode", "cors")
             .header("sec-fetch-site", "same-origin")
-            .timeout(Duration.ofSeconds(20))
+            .timeout(Duration.ofSeconds(REQUEST_TIMEOUT_SEC))
             .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8));
         HttpRequest req = builder.build();
 
         for (int attempt = 1; attempt <= maxRetries; attempt++) {
-            HttpResponse<String> res = HTTP.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            HttpResponse<String> res;
+            try {
+                res = HTTP.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            } catch (HttpTimeoutException timeout) {
+                int retryDelayMs = computeRetryDelayMs(attempt);
+                if (attempt < maxRetries) {
+                    BeamQueueLog.warn("AI API timeout (attempt {}/{}), retrying in {}ms", attempt, maxRetries, retryDelayMs);
+                    Thread.sleep(retryDelayMs);
+                    continue;
+                }
+                BeamQueueLog.warn("AI API timeout (attempt {}/{}), retries exhausted", attempt, maxRetries);
+                throw timeout;
+            }
             BeamQueueLog.debug("AI API attempt {} status={} bodyLength={}", attempt, res.statusCode(), res.body().length());
             if (res.statusCode() == 200) {
                 String content = extractContentFromAnyShape(res.body());
@@ -638,6 +654,19 @@ public final class BeamQueueAiReply {
         return out;
     }
 
+    private static boolean looksLikeAiRefusal(String reply) {
+        if (reply == null) return false;
+        String r = reply.toLowerCase().trim();
+        if (r.isEmpty()) return false;
+        return r.contains("as an ai")
+            || r.contains("i can't assist")
+            || r.contains("i cannot assist")
+            || r.contains("i'm unable to")
+            || r.contains("i apologize")
+            || r.contains("personal information")
+            || r.contains("i don't have the ability");
+    }
+
     private static String buildSystemPrompt() {
         String shareTarget = BeamQueueMod.getShareTargetMasked();
         String modeLabel = BeamQueueMod.isShareModeDiscord() ? "discord invite" : "server ip";
@@ -662,7 +691,7 @@ public final class BeamQueueAiReply {
             "Only mention the tournament if it feels natural, don't force it. " +
             "Do not repeat tournament details unless asked. " +
             " " +
-            "If asked identity/source (e.g., who sent u) -> say something casual like just saw u online lol. " +
+            "If asked identity/source, keep it casual and vague. " +
             "If asked when -> say in 20 mins. " +
             "If asked where/server/join -> say " + shareTarget + " exactly like that. " +
             "If asked player count -> say around 50 ppl. " +
