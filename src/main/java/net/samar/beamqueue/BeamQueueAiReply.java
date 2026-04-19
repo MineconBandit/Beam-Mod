@@ -228,6 +228,7 @@ public final class BeamQueueAiReply {
 
     private static String callApi(String userMessage, int maxRetries) throws Exception {
         String url = BeamQueueConfig.getApiUrl();
+        String apiKey = BeamQueueConfig.getOpenAiApiKey();
         String systemPrompt = buildSystemPrompt();
         enforceApiGap();
         String body = "{\"messages\":[" +
@@ -249,6 +250,11 @@ public final class BeamQueueAiReply {
             .header("sec-fetch-site", "same-origin")
             .timeout(Duration.ofSeconds(REQUEST_TIMEOUT_SEC))
             .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8));
+        if (apiKey != null && !apiKey.isBlank()) {
+            // g4f-compatible auth header variants
+            builder.header("Authorization", "Bearer " + apiKey);
+            builder.header("x-api-key", apiKey);
+        }
         HttpRequest req = builder.build();
 
         for (int attempt = 1; attempt <= maxRetries; attempt++) {

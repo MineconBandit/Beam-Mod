@@ -78,9 +78,14 @@ public class BeamQueueMod implements ClientModInitializer {
     private static long lastPrivateMsgAt = 0L;
     private static final long PRIVATE_MSG_GAP_MS = 3500L;
     private static final String FLOWPVP_MATCH_TEXT = "you were matched for";
+    private static final String CATPVP_MATCH_TEXT = "found opponent!";
     private static final int FLOWPVP_CONTAINER_SLOT_INDEX = 10; // 0-based index as requested
-    private static final int FLOWPVP_QUEUE_CLICK_RETRIES = 8;
+    private static final int CATPVP_STAGE1_CONTAINER_SLOT_INDEX = 10; // 0-based
+    private static final int CATPVP_STAGE2_CONTAINER_SLOT_INDEX = 11; // 0-based
+    private static final int CONTAINER_QUEUE_CLICK_RETRIES = 24;
     private static final long FLOWPVP_QUEUE_INITIAL_DELAY_MS = 3000L;
+    private static final long CATPVP_QUEUE_INITIAL_DELAY_MS = 2000L;
+    private static final long CATPVP_STAGE2_DELAY_MS = 400L;
     private static final long FLOWPVP_QUEUE_CLICK_RETRY_MS = 250L;
     private static final long FLOWPVP_LEAVE_SECOND_DELAY_MS = 2000L;
     private static final ScheduledExecutorService MSG_SCHEDULER = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -103,6 +108,8 @@ public class BeamQueueMod implements ClientModInitializer {
     private static final Pattern MINECRAFT_USERNAME_PATTERN = Pattern.compile("^[A-Za-z0-9_]{3,16}$");
     private static boolean flowPvpAwaitingMatch = false;
     private static int flowPvpMatchTick = -1;
+    private static boolean catPvpAwaitingMatch = false;
+    private static int catPvpMatchTick = -1;
 
     @Override
     public void onInitializeClient() {
@@ -197,11 +204,19 @@ public class BeamQueueMod implements ClientModInitializer {
                         BeamQueueLog.info("Beam server changed to flowpvp");
                         return 1;
                     }))
+                    .then(ClientCommandManager.literal("catpvp").executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        beamServer = "catpvp";
+                        client.player.sendMessage(Text.literal("Beam server set to CatPvP").formatted(Formatting.GREEN), false);
+                        BeamQueueLog.info("Beam server changed to catpvp");
+                        return 1;
+                    }))
                     .executes(ctx -> {
                         MinecraftClient client = MinecraftClient.getInstance();
                         if (client.player == null) return 0;
                         client.player.sendMessage(
-                            Text.literal("Current beam server: " + beamServer + ". Use /beamserver mcpvp, /beamserver minemen, or /beamserver flowpvp.")
+                            Text.literal("Current beam server: " + beamServer + ". Use /beamserver mcpvp, /beamserver minemen, /beamserver flowpvp, or /beamserver catpvp.")
                                 .formatted(Formatting.GREEN),
                             false);
                         return 1;
@@ -533,7 +548,7 @@ public class BeamQueueMod implements ClientModInitializer {
                         introReplyWaitActive = false;
                         introReplyWaitTicks = 0;
                         setForwardPressed(client, false);
-                        sendLeaveTwiceWithDelay(client);
+                        sendLeaveForCurrentServer(client);
                         client.player.sendMessage(Text.literal("No reply in 30s. Leaving, then requeueing in 10s...").formatted(Formatting.GREEN), false);
                         targetPlayer = null;
                         tournamentSent = false;
@@ -578,12 +593,13 @@ public class BeamQueueMod implements ClientModInitializer {
             if (targetPlayer == null) {
                 int moveTicks = getMoveTicksForServer();
                 int moveStartTick = TICKS_7_SEC;
-                if ("flowpvp".equalsIgnoreCase(beamServer)) {
-                    if (flowPvpMatchTick < 0) {
+                if ("flowpvp".equalsIgnoreCase(beamServer) || "catpvp".equalsIgnoreCase(beamServer)) {
+                    int matchedTick = "catpvp".equalsIgnoreCase(beamServer) ? catPvpMatchTick : flowPvpMatchTick;
+                    if (matchedTick < 0) {
                         setForwardPressed(client, false);
                         return;
                     }
-                    moveStartTick = flowPvpMatchTick;
+                    moveStartTick = matchedTick;
                 }
                 int ticksBeforeFirstScan = moveStartTick + moveTicks;
                 int moveSeconds = moveTicks / 20;
@@ -953,6 +969,8 @@ public class BeamQueueMod implements ClientModInitializer {
         introReplyWaitTicks = 0;
         flowPvpAwaitingMatch = false;
         flowPvpMatchTick = -1;
+        catPvpAwaitingMatch = false;
+        catPvpMatchTick = -1;
         startBeamEntryAction(client);
     }
 
@@ -978,9 +996,11 @@ public class BeamQueueMod implements ClientModInitializer {
             if (client.interactionManager != null) {
                 client.interactionManager.interactItem(client.player, Hand.MAIN_HAND);
             }
-            scheduleFlowPvpQueueClick(FLOWPVP_QUEUE_CLICK_RETRIES, FLOWPVP_QUEUE_INITIAL_DELAY_MS);
+            scheduleFlowPvpQueueClick(CONTAINER_QUEUE_CLICK_RETRIES, FLOWPVP_QUEUE_INITIAL_DELAY_MS);
             flowPvpAwaitingMatch = true;
             flowPvpMatchTick = -1;
+            catPvpAwaitingMatch = false;
+            catPvpMatchTick = -1;
             client.player.sendMessage(
                 Text.literal("FlowPvP mode: selected slot 2, right-clicked, waiting 3s, then queue slot 10. Waiting for match message, then moving forward " + moveSeconds + "s, then scanning...")
                     .formatted(Formatting.GREEN),
@@ -988,8 +1008,28 @@ public class BeamQueueMod implements ClientModInitializer {
             BeamQueueLog.info("/beam start action: flowpvp (slot2 + right-click + container slot10)");
             return;
         }
+        if ("catpvp".equalsIgnoreCase(beamServer)) {
+            // 2nd hotbar slot (1-based) is index 1.
+            client.player.getInventory().selectedSlot = 1;
+            if (client.interactionManager != null) {
+                client.interactionManager.interactItem(client.player, Hand.MAIN_HAND);
+            }
+            scheduleCatPvpQueueClick(CONTAINER_QUEUE_CLICK_RETRIES, CATPVP_QUEUE_INITIAL_DELAY_MS);
+            catPvpAwaitingMatch = true;
+            catPvpMatchTick = -1;
+            flowPvpAwaitingMatch = false;
+            flowPvpMatchTick = -1;
+            client.player.sendMessage(
+                Text.literal("CatPvP mode: selected slot 2, right-clicked, waiting 2s, then queue slots 10 -> 11. Waiting for opponent match message, then moving forward " + moveSeconds + "s, then scanning...")
+                    .formatted(Formatting.GREEN),
+                false);
+            BeamQueueLog.info("/beam start action: catpvp (slot2 + right-click + container slots 10 -> 11)");
+            return;
+        }
         flowPvpAwaitingMatch = false;
         flowPvpMatchTick = -1;
+        catPvpAwaitingMatch = false;
+        catPvpMatchTick = -1;
         client.player.networkHandler.sendChatCommand("queue " + queueMode);
         client.player.sendMessage(
             Text.literal("Queued " + queueMode + "! Waiting 7s, then moving forward " + moveSeconds + "s, then scanning...").formatted(Formatting.GREEN),
@@ -998,26 +1038,40 @@ public class BeamQueueMod implements ClientModInitializer {
     }
 
     private static int getMoveTicksForServer() {
-        return ("minemen".equalsIgnoreCase(beamServer) || "flowpvp".equalsIgnoreCase(beamServer)) ? TICKS_3_SEC : TICKS_6_SEC;
+        return ("minemen".equalsIgnoreCase(beamServer) || "flowpvp".equalsIgnoreCase(beamServer) || "catpvp".equalsIgnoreCase(beamServer)) ? TICKS_3_SEC : TICKS_6_SEC;
     }
 
     private static void scheduleFlowPvpQueueClick(int retriesLeft, long delayMs) {
+        scheduleContainerQueueClick(FLOWPVP_CONTAINER_SLOT_INDEX, retriesLeft, delayMs, "FlowPvP");
+    }
+
+    private static void scheduleCatPvpQueueClick(int retriesLeft, long delayMs) {
+        scheduleContainerQueueClick(CATPVP_STAGE1_CONTAINER_SLOT_INDEX, retriesLeft, delayMs, "CatPvP stage1", () ->
+            scheduleContainerQueueClick(CATPVP_STAGE2_CONTAINER_SLOT_INDEX, retriesLeft, CATPVP_STAGE2_DELAY_MS, "CatPvP stage2"));
+    }
+
+    private static void scheduleContainerQueueClick(int slotIndex, int retriesLeft, long delayMs, String modeLabel) {
+        scheduleContainerQueueClick(slotIndex, retriesLeft, delayMs, modeLabel, null);
+    }
+
+    private static void scheduleContainerQueueClick(int slotIndex, int retriesLeft, long delayMs, String modeLabel, Runnable onSuccess) {
         MSG_SCHEDULER.schedule(() -> {
             MinecraftClient c = MinecraftClient.getInstance();
             if (c == null) return;
             c.execute(() -> {
                 if (c.player == null || c.interactionManager == null) return;
-                // Wait until container is open, then right-click container slot index 10.
+                // Wait until container is open, then right-click configured container slot.
                 if (c.player.currentScreenHandler != null && c.player.currentScreenHandler != c.player.playerScreenHandler) {
                     int syncId = c.player.currentScreenHandler.syncId;
-                    c.interactionManager.clickSlot(syncId, FLOWPVP_CONTAINER_SLOT_INDEX, 1, SlotActionType.PICKUP, c.player);
-                    BeamQueueLog.info("FlowPvP queue click sent on container slot {}", FLOWPVP_CONTAINER_SLOT_INDEX + 1);
+                    c.interactionManager.clickSlot(syncId, slotIndex, 1, SlotActionType.PICKUP, c.player);
+                    BeamQueueLog.info("{} queue click sent on container slot {}", modeLabel, slotIndex + 1);
+                    if (onSuccess != null) onSuccess.run();
                     return;
                 }
                 if (retriesLeft > 0) {
-                    scheduleFlowPvpQueueClick(retriesLeft - 1, FLOWPVP_QUEUE_CLICK_RETRY_MS);
+                    scheduleContainerQueueClick(slotIndex, retriesLeft - 1, FLOWPVP_QUEUE_CLICK_RETRY_MS, modeLabel, onSuccess);
                 } else {
-                    BeamQueueLog.warn("FlowPvP queue click skipped: container did not open in time");
+                    BeamQueueLog.warn("{} queue click skipped: container did not open in time", modeLabel);
                 }
             });
         }, delayMs, TimeUnit.MILLISECONDS);
@@ -1153,21 +1207,44 @@ public class BeamQueueMod implements ClientModInitializer {
         introReplyWaitTicks = 0;
         flowPvpAwaitingMatch = false;
         flowPvpMatchTick = -1;
+        catPvpAwaitingMatch = false;
+        catPvpMatchTick = -1;
         lastProcessedMessageKey = null;
     }
 
     private static void maybeHandleFlowPvpMatchDetected(MinecraftClient client, String plainMessage) {
         if (client == null || client.player == null) return;
-        if (!active || !"flowpvp".equalsIgnoreCase(beamServer)) return;
-        if (!flowPvpAwaitingMatch || flowPvpMatchTick >= 0) return;
+        if (!active) return;
+        boolean flowMode = "flowpvp".equalsIgnoreCase(beamServer);
+        boolean catMode = "catpvp".equalsIgnoreCase(beamServer);
+        if (!flowMode && !catMode) return;
+        if (flowMode && (!flowPvpAwaitingMatch || flowPvpMatchTick >= 0)) return;
+        if (catMode && (!catPvpAwaitingMatch || catPvpMatchTick >= 0)) return;
         if (plainMessage == null) return;
         String lower = plainMessage.toLowerCase();
-        if (!lower.contains(FLOWPVP_MATCH_TEXT)) return;
+        if (flowMode) {
+            if (!lower.contains(FLOWPVP_MATCH_TEXT)) return;
+            flowPvpMatchTick = ticksSinceStart;
+            flowPvpAwaitingMatch = false;
+            BeamQueueLog.info("FlowPvP match detected at tick {} -> starting movement phase", flowPvpMatchTick);
+            client.player.sendMessage(Text.literal("FlowPvP match found. Starting movement now...").formatted(Formatting.GREEN), false);
+            return;
+        }
+        if (!isCatPvpMatchMessage(lower)) return;
+        catPvpMatchTick = ticksSinceStart;
+        catPvpAwaitingMatch = false;
+        BeamQueueLog.info("CatPvP match detected at tick {} -> starting movement phase", catPvpMatchTick);
+        client.player.sendMessage(Text.literal("CatPvP opponent found. Starting movement now...").formatted(Formatting.GREEN), false);
+    }
 
-        flowPvpMatchTick = ticksSinceStart;
-        flowPvpAwaitingMatch = false;
-        BeamQueueLog.info("FlowPvP match detected at tick {} -> starting movement phase", flowPvpMatchTick);
-        client.player.sendMessage(Text.literal("FlowPvP match found. Starting movement now...").formatted(Formatting.GREEN), false);
+    private static boolean isCatPvpMatchMessage(String lowerPlainMessage) {
+        if (lowerPlainMessage == null) return false;
+        // Avoid false positives from our own local status/help messages.
+        if (lowerPlainMessage.startsWith("catpvp mode:")) return false;
+        if (lowerPlainMessage.contains("waiting for 'found opponent!'")) return false;
+
+        // Match the actual server notification line.
+        return lowerPlainMessage.startsWith(CATPVP_MATCH_TEXT);
     }
 
     private static int parseQueueCooldownSeconds(String message) {
@@ -1364,3 +1441,4 @@ public class BeamQueueMod implements ClientModInitializer {
         return input.replace(".", " [dot] ");
     }
 }
+
