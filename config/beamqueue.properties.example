@@ -1,4 +1,4 @@
-# Beam Queue – AI reply config (g4f.dev)
+﻿# Beam Queue – AI reply config (g4f.dev)
 # Copy to <game-dir>/config/beamqueue.properties and set your key.
 # Or set env BEAMQUEUE_API_KEY or BEAMQUEUE_OPENAI_API_KEY.
 

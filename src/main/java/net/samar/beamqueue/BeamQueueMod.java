@@ -1,21 +1,31 @@
 package net.samar.beamqueue;
 
+import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
-import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import net.minecraft.client.MinecraftClient;
-import net.minecraft.client.option.KeyBinding;
-import net.minecraft.client.util.InputUtil;
 import net.minecraft.client.network.AbstractClientPlayerEntity;
 import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.util.InputUtil;
+import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.Text;
+import net.minecraft.util.Hand;
 import net.minecraft.util.Formatting;
 
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -24,49 +34,76 @@ public class BeamQueueMod implements ClientModInitializer {
     public static boolean active = false;
     public static String targetPlayer = null;
     public static int ticksSinceStart = 0;
-    /** Number of scan attempts so far (0–3); we do 4 total scans after 7s wait + 6s move. */
     public static int scanAttempts = 0;
-    /** Tick when we set targetPlayer (so we send tournament msg 1s later). */
     public static int targetSetTick = 0;
     public static boolean tournamentSent = false;
-    /** After target declines or player death: /leave, then wait 10s and restart beam. */
     public static boolean restartAfterLeave = false;
     public static int leaveWaitTicks = 0;
-    /** Death detected from chat message (e.g. "X was slain by Y"): wait 4s then /leave and restart. */
+
     private static boolean deathMessageSeen = false;
     private static int deathWaitTicks = 0;
     private static final int TICKS_4_SEC = 80;
-    /** Queue cooldown (e.g. "You are on queue cooldown for 6m, 54s..."): wait that long then startBeamAgain. */
+
     private static boolean queueCooldownActive = false;
     private static int queueCooldownTicks = 0;
-    /** Dedupe: skip same (target, reply) within this window (ms). */
+
     private static String lastProcessedMessageKey = null;
     private static long lastProcessedMessageTime = 0;
     private static final long DEDUPE_MS = 2500;
-    /** Re-entry guard: sending /msg etc. from inside handler can trigger another GAME/CHAT event -> StackOverflow. */
+
     private static volatile boolean inMessageHandler = false;
-    /** After positive reply: wait 45s, keep forwarding target messages to AI, then /leave and restart. */
+
     private static boolean postPositiveActive = false;
     private static int postPositiveWaitTicks = 0;
-    /** After beam timeout: wait 10s then startBeamAgain. */
+
     private static boolean timeoutRestartPending = false;
     private static int timeoutRestartTicks = 0;
+    private static boolean introReplyWaitActive = false;
+    private static int introReplyWaitTicks = 0;
+
+    private static String queueMode = "sword";
+    private static String beamServer = "mcpvp";
+    private static String shareMode = "ip";
+    private static String serverIpPlain = "mc-feather.com";
+    private static String discordInvitePlain = "discord.gg/fnw";
+    private static boolean autoReconnectEnabled = true;
+    private static boolean pendingAutoReconnect = false;
+    private static int autoReconnectWaitTicks = 0;
+    private static final int TICKS_AUTO_RECONNECT_DELAY = 200; // 10s
+    private static String lastServerAddress = null;
+    private static String lastServerName = "Server";
+
+    private static long lastPrivateMsgAt = 0L;
+    private static final long PRIVATE_MSG_GAP_MS = 3500L;
+    private static final int FLOWPVP_CONTAINER_SLOT_INDEX = 10; // 0-based index as requested
+    private static final int FLOWPVP_QUEUE_CLICK_RETRIES = 8;
+    private static final long FLOWPVP_QUEUE_INITIAL_DELAY_MS = 3000L;
+    private static final long FLOWPVP_QUEUE_CLICK_RETRY_MS = 250L;
+    private static final long FLOWPVP_LEAVE_SECOND_DELAY_MS = 2000L;
+    private static final ScheduledExecutorService MSG_SCHEDULER = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "beamqueue-msg-scheduler");
+        t.setDaemon(true);
+        return t;
+    });
 
     private static final int TICKS_7_SEC = 140;
-    private static final int TICKS_6_SEC = 120; // walk forward duration
-    private static final int TICKS_5_SEC = 100;
+    private static final int TICKS_3_SEC = 60;
+    private static final int TICKS_6_SEC = 120;
     private static final int TICKS_10_SEC = 200;
+    private static final int TICKS_30_SEC = 600;
     private static final int TICKS_45_SEC = 900;
     private static final int TICKS_1_SEC = 20;
+    private static final int TICKS_TARGET_FOLLOWUP_DELAY = 70; // 3.5s between "hi" and tournament invite
     private static final int TICKS_BEAM_TIMEOUT = 1800;
     private static final int MAX_SCAN_ATTEMPTS = 4;
-    private static final double MAX_SQ_DISTANCE = 2500; // 50^2
-    /** First scan at 7s + 6s = 13s; then every 7s (4 scans total). */
-    private static final int TICKS_BEFORE_FIRST_SCAN = TICKS_7_SEC + TICKS_6_SEC;
+    private static final double MAX_SQ_DISTANCE = 2500;
+    private static final Pattern MINECRAFT_USERNAME_PATTERN = Pattern.compile("^[A-Za-z0-9_]{3,16}$");
 
     @Override
     public void onInitializeClient() {
         BeamQueueLog.info("Beam Queue client init");
+        BeamQueueAiReply.startHealthChecks();
+
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
             dispatcher.register(
                 ClientCommandManager.literal("beam").executes(ctx -> {
@@ -77,27 +114,246 @@ public class BeamQueueMod implements ClientModInitializer {
                     }
                     if (active) {
                         BeamQueueLog.debug("/beam ignored: already active");
-                        client.player.sendMessage(
-                            Text.literal("Beam is already active!").formatted(Formatting.GREEN), false);
+                        client.player.sendMessage(Text.literal("Beam is already active!").formatted(Formatting.GREEN), false);
                         return 1;
                     }
                     active = true;
                     targetPlayer = null;
                     ticksSinceStart = 0;
                     scanAttempts = 0;
-                    client.player.networkHandler.sendChatCommand("queue sword");
-                    client.player.sendMessage(
-                        Text.literal("Queued sword! Waiting 7s, then moving forward 6s, then scanning...").formatted(Formatting.GREEN), false);
-                    BeamQueueLog.info("/beam started: queue sword sent, sequence started (7s wait -> 6s move -> scan x4)");
+                    startBeamEntryAction(client);
                     return 1;
                 })
+            );
+            dispatcher.register(
+                ClientCommandManager.literal("beamstop").executes(ctx -> {
+                    MinecraftClient client = MinecraftClient.getInstance();
+                    if (!active) {
+                        if (client.player != null) {
+                            client.player.sendMessage(Text.literal("Beam is not active.").formatted(Formatting.GREEN), false);
+                        }
+                        return 0;
+                    }
+                    reset();
+                    if (client.player != null) {
+                        client.player.sendMessage(Text.literal("Beam stopped.").formatted(Formatting.GREEN), false);
+                    }
+                    BeamQueueLog.info("/beamstop: beam session stopped");
+                    return 1;
+                })
+            );
+
+            dispatcher.register(
+                ClientCommandManager.literal("changequeue")
+                    .then(ClientCommandManager.argument("mode", StringArgumentType.greedyString()).executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        String mode = sanitizeCommandValue(StringArgumentType.getString(ctx, "mode"));
+                        if (mode.isBlank()) {
+                            client.player.sendMessage(Text.literal("Usage: /changequeue <mode>").formatted(Formatting.GREEN), false);
+                            return 0;
+                        }
+                        queueMode = mode;
+                        client.player.sendMessage(Text.literal("Queue mode set to: " + queueMode).formatted(Formatting.GREEN), false);
+                        BeamQueueLog.info("Queue mode changed to {}", queueMode);
+                        return 1;
+                    }))
+                    .executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        client.player.sendMessage(Text.literal("Current queue mode: " + queueMode).formatted(Formatting.GREEN), false);
+                        return 1;
+                    })
+            );
+
+            dispatcher.register(
+                ClientCommandManager.literal("beamserver")
+                    .then(ClientCommandManager.literal("mcpvp").executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        beamServer = "mcpvp";
+                        client.player.sendMessage(Text.literal("Beam server set to MCPvP").formatted(Formatting.GREEN), false);
+                        BeamQueueLog.info("Beam server changed to mcpvp");
+                        return 1;
+                    }))
+                    .then(ClientCommandManager.literal("minemen").executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        beamServer = "minemen";
+                        client.player.sendMessage(Text.literal("Beam server set to Minemen").formatted(Formatting.GREEN), false);
+                        BeamQueueLog.info("Beam server changed to minemen");
+                        return 1;
+                    }))
+                    .then(ClientCommandManager.literal("flowpvp").executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        beamServer = "flowpvp";
+                        client.player.sendMessage(Text.literal("Beam server set to FlowPvP").formatted(Formatting.GREEN), false);
+                        BeamQueueLog.info("Beam server changed to flowpvp");
+                        return 1;
+                    }))
+                    .executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        client.player.sendMessage(
+                            Text.literal("Current beam server: " + beamServer + ". Use /beamserver mcpvp, /beamserver minemen, or /beamserver flowpvp.")
+                                .formatted(Formatting.GREEN),
+                            false);
+                        return 1;
+                    })
+            );
+
+            dispatcher.register(
+                ClientCommandManager.literal("autoreconnect")
+                    .then(ClientCommandManager.literal("on").executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        autoReconnectEnabled = true;
+                        if (client.player != null) {
+                            client.player.sendMessage(Text.literal("Auto reconnect: ON").formatted(Formatting.GREEN), false);
+                        }
+                        return 1;
+                    }))
+                    .then(ClientCommandManager.literal("off").executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        autoReconnectEnabled = false;
+                        pendingAutoReconnect = false;
+                        autoReconnectWaitTicks = 0;
+                        if (client.player != null) {
+                            client.player.sendMessage(Text.literal("Auto reconnect: OFF").formatted(Formatting.GREEN), false);
+                        }
+                        return 1;
+                    }))
+                    .executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player != null) {
+                            client.player.sendMessage(
+                                Text.literal("Auto reconnect is " + (autoReconnectEnabled ? "ON" : "OFF"))
+                                    .formatted(Formatting.GREEN),
+                                false);
+                        }
+                        return 1;
+                    })
+            );
+
+            dispatcher.register(
+                ClientCommandManager.literal("changeip")
+                    .then(ClientCommandManager.argument("ip", StringArgumentType.greedyString()).executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        String ip = sanitizeCommandValue(StringArgumentType.getString(ctx, "ip"));
+                        if (ip.isBlank()) {
+                            client.player.sendMessage(Text.literal("Usage: /changeip <server ip>").formatted(Formatting.GREEN), false);
+                            return 0;
+                        }
+                        serverIpPlain = ip;
+                        client.player.sendMessage(
+                            Text.literal("Server IP set to: " + getServerIpMasked() + " (mode stays " + shareMode + ")")
+                                .formatted(Formatting.GREEN),
+                            false);
+                        BeamQueueLog.info("Server IP changed to {}", serverIpPlain);
+                        return 1;
+                    }))
+                    .executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        client.player.sendMessage(Text.literal("Current server IP: " + getServerIpMasked()).formatted(Formatting.GREEN), false);
+                        return 1;
+                    })
+            );
+
+            dispatcher.register(
+                ClientCommandManager.literal("changemode")
+                    .then(ClientCommandManager.literal("ip")
+                        .then(ClientCommandManager.argument("value", StringArgumentType.greedyString()).executes(ctx -> {
+                            MinecraftClient client = MinecraftClient.getInstance();
+                            if (client.player == null) return 0;
+                            String value = sanitizeCommandValue(StringArgumentType.getString(ctx, "value"));
+                            if (value.isBlank()) {
+                                client.player.sendMessage(Text.literal("Usage: /changemode ip <server ip>").formatted(Formatting.GREEN), false);
+                                return 0;
+                            }
+                            serverIpPlain = value;
+                            shareMode = "ip";
+                            client.player.sendMessage(Text.literal("Share mode: IP (" + getShareTargetMasked() + ")").formatted(Formatting.GREEN), false);
+                            BeamQueueLog.info("Share mode changed to ip with value {}", serverIpPlain);
+                            return 1;
+                        }))
+                        .executes(ctx -> {
+                            MinecraftClient client = MinecraftClient.getInstance();
+                            if (client.player == null) return 0;
+                            shareMode = "ip";
+                            client.player.sendMessage(Text.literal("Share mode set to IP (" + getShareTargetMasked() + ")").formatted(Formatting.GREEN), false);
+                            BeamQueueLog.info("Share mode changed to ip");
+                            return 1;
+                        }))
+                    .then(ClientCommandManager.literal("discord")
+                        .then(ClientCommandManager.argument("value", StringArgumentType.greedyString()).executes(ctx -> {
+                            MinecraftClient client = MinecraftClient.getInstance();
+                            if (client.player == null) return 0;
+                            String value = sanitizeCommandValue(StringArgumentType.getString(ctx, "value"));
+                            if (value.isBlank()) {
+                                client.player.sendMessage(Text.literal("Usage: /changemode discord <invite>").formatted(Formatting.GREEN), false);
+                                return 0;
+                            }
+                            discordInvitePlain = value;
+                            shareMode = "discord";
+                            client.player.sendMessage(Text.literal("Share mode: Discord (" + getShareTargetMasked() + ")").formatted(Formatting.GREEN), false);
+                            BeamQueueLog.info("Share mode changed to discord with value {}", discordInvitePlain);
+                            return 1;
+                        }))
+                        .executes(ctx -> {
+                            MinecraftClient client = MinecraftClient.getInstance();
+                            if (client.player == null) return 0;
+                            shareMode = "discord";
+                            client.player.sendMessage(Text.literal("Share mode set to Discord (" + getShareTargetMasked() + ")").formatted(Formatting.GREEN), false);
+                            BeamQueueLog.info("Share mode changed to discord");
+                            return 1;
+                        }))
+                    .executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        client.player.sendMessage(
+                            Text.literal("Usage: /changemode ip <server ip> OR /changemode discord <invite>. Current: " + shareMode + " -> " + getShareTargetMasked())
+                                .formatted(Formatting.GREEN),
+                            false);
+                        return 1;
+                    })
+            );
+
+            dispatcher.register(
+                ClientCommandManager.literal("apikey")
+                    .then(ClientCommandManager.argument("key", StringArgumentType.greedyString()).executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        String key = sanitizeCommandValue(StringArgumentType.getString(ctx, "key"));
+                        if (key.isBlank()) {
+                            client.player.sendMessage(Text.literal("Usage: /apikey <g4f-api-key>").formatted(Formatting.GREEN), false);
+                            return 0;
+                        }
+                        boolean saved = BeamQueueConfig.setApiKey(key);
+                        BeamQueueAiReply.triggerHealthCheckNow();
+                        if (saved) {
+                            client.player.sendMessage(Text.literal("API key set and saved.").formatted(Formatting.GREEN), false);
+                        } else {
+                            client.player.sendMessage(Text.literal("API key set for now, but failed to save config file.").formatted(Formatting.GREEN), false);
+                        }
+                        BeamQueueLog.info("API key updated via /apikey command");
+                        return 1;
+                    }))
+                    .executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        client.player.sendMessage(Text.literal("Usage: /apikey <g4f-api-key>").formatted(Formatting.GREEN), false);
+                        return 1;
+                    })
             );
         });
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            captureCurrentServer(client);
+            tickAutoReconnect(client);
             if (!active) return;
 
-            // Queue cooldown: wait parsed duration (e.g. 6m 54s) then startBeamAgain
             if (queueCooldownActive) {
                 if (client.player != null) {
                     queueCooldownTicks--;
@@ -106,8 +362,7 @@ public class BeamQueueMod implements ClientModInitializer {
                         queueCooldownTicks = 0;
                         BeamQueueLog.info("Queue cooldown finished -> startBeamAgain");
                         if (client.world != null) {
-                            client.player.sendMessage(
-                                Text.literal("Cooldown over. Requeuing...").formatted(Formatting.GREEN), false);
+                            client.player.sendMessage(Text.literal("Cooldown over. Requeuing...").formatted(Formatting.GREEN), false);
                         }
                         startBeamAgain(client);
                     }
@@ -115,18 +370,15 @@ public class BeamQueueMod implements ClientModInitializer {
                 return;
             }
 
-            // After death message: wait 4 seconds then /leave and restart (same flow as restartAfterLeave)
             if (deathMessageSeen) {
                 if (client.player != null) {
                     deathWaitTicks++;
-                    BeamQueueLog.debug("Death wait countdown: {} / {} ticks", deathWaitTicks, TICKS_4_SEC);
                     if (deathWaitTicks >= TICKS_4_SEC) {
                         deathMessageSeen = false;
                         deathWaitTicks = 0;
                         setForwardPressed(client, false);
-                        client.player.networkHandler.sendChatCommand("leave");
-                        client.player.sendMessage(
-                            Text.literal("Death detected. Leaving, then requeueing in 10s...").formatted(Formatting.GREEN), false);
+                        sendLeaveForCurrentServer(client);
+                        client.player.sendMessage(Text.literal("Death detected. Leaving, then requeueing in 10s...").formatted(Formatting.GREEN), false);
                         targetPlayer = null;
                         tournamentSent = false;
                         restartAfterLeave = true;
@@ -136,22 +388,19 @@ public class BeamQueueMod implements ClientModInitializer {
                 return;
             }
 
-            // After /leave: wait 10 seconds (in-world) then startBeamAgain – only count when we have world so it's 10s real wait
             if (restartAfterLeave) {
                 if (client.player != null && client.world != null) {
                     leaveWaitTicks++;
-                    BeamQueueLog.debug("Leave restart countdown: {} / {} ticks", leaveWaitTicks, TICKS_10_SEC);
                     if (leaveWaitTicks >= TICKS_10_SEC) {
                         restartAfterLeave = false;
                         leaveWaitTicks = 0;
-                        BeamQueueLog.info("Restarting beam after leave (sending queue sword)");
+                        BeamQueueLog.info("Restarting beam after leave (server mode: {})", beamServer);
                         startBeamAgain(client);
                     }
                 }
                 return;
             }
 
-            // After positive reply: wait 45s (forward target messages to AI), then /leave and restart
             if (postPositiveActive) {
                 if (client.player != null && client.world != null) {
                     postPositiveWaitTicks++;
@@ -159,9 +408,8 @@ public class BeamQueueMod implements ClientModInitializer {
                         postPositiveActive = false;
                         postPositiveWaitTicks = 0;
                         setForwardPressed(client, false);
-                        client.player.networkHandler.sendChatCommand("leave");
-                        client.player.sendMessage(
-                            Text.literal("Leaving now, then requeueing in 10s...").formatted(Formatting.GREEN), false);
+                        sendLeaveForCurrentServer(client);
+                        client.player.sendMessage(Text.literal("Leaving now, then requeueing in 10s...").formatted(Formatting.GREEN), false);
                         targetPlayer = null;
                         tournamentSent = false;
                         restartAfterLeave = true;
@@ -171,14 +419,30 @@ public class BeamQueueMod implements ClientModInitializer {
                 return;
             }
 
-            // After beam timeout: wait 10s then startBeamAgain
+            if (introReplyWaitActive) {
+                if (client.player != null && client.world != null) {
+                    introReplyWaitTicks++;
+                    if (introReplyWaitTicks >= TICKS_30_SEC) {
+                        introReplyWaitActive = false;
+                        introReplyWaitTicks = 0;
+                        setForwardPressed(client, false);
+                        sendLeaveTwiceWithDelay(client);
+                        client.player.sendMessage(Text.literal("No reply in 30s. Leaving, then requeueing in 10s...").formatted(Formatting.GREEN), false);
+                        targetPlayer = null;
+                        tournamentSent = false;
+                        restartAfterLeave = true;
+                        leaveWaitTicks = 0;
+                    }
+                }
+                return;
+            }
+
             if (timeoutRestartPending) {
                 if (client.player != null && client.world != null) {
                     timeoutRestartTicks++;
                     if (timeoutRestartTicks >= TICKS_10_SEC) {
                         timeoutRestartPending = false;
                         timeoutRestartTicks = 0;
-                        BeamQueueLog.info("Timeout wait over -> startBeamAgain");
                         client.player.sendMessage(Text.literal("Restarting beam...").formatted(Formatting.GREEN), false);
                         startBeamAgain(client);
                     }
@@ -186,9 +450,7 @@ public class BeamQueueMod implements ClientModInitializer {
                 return;
             }
 
-            // Pause sequence during teleport/world load (don't reset – only reset on disconnect)
             if (client.player == null || client.world == null) {
-                BeamQueueLog.debug("Tick skipped: world or player null (pausing until world loads)");
                 setForwardPressed(client, false);
                 return;
             }
@@ -196,7 +458,6 @@ public class BeamQueueMod implements ClientModInitializer {
             ticksSinceStart++;
 
             if (ticksSinceStart >= TICKS_BEAM_TIMEOUT) {
-                BeamQueueLog.info("Beam timed out at tick {} -> wait 10s then restart", ticksSinceStart);
                 client.player.sendMessage(Text.literal("Beam timed out. Restarting in 10s...").formatted(Formatting.GREEN), false);
                 setForwardPressed(client, false);
                 targetPlayer = null;
@@ -207,30 +468,40 @@ public class BeamQueueMod implements ClientModInitializer {
             }
 
             if (targetPlayer == null) {
-                // Phase 1: wait 7s. Phase 2: move forward 6s. Phase 3: scan at 13s, 20s, 27s, 34s (4 attempts).
+                int moveTicks = getMoveTicksForServer();
+                int ticksBeforeFirstScan = TICKS_7_SEC + moveTicks;
+                int moveSeconds = moveTicks / 20;
                 if (ticksSinceStart == TICKS_7_SEC) {
-                    BeamQueueLog.debug("Phase: moving forward for 6s (tick {})", ticksSinceStart);
-                    client.player.sendMessage(Text.literal("Moving forward for 6s...").formatted(Formatting.GREEN), false);
+                    client.player.sendMessage(Text.literal("Moving forward for " + moveSeconds + "s...").formatted(Formatting.GREEN), false);
                 }
-                if (ticksSinceStart >= TICKS_7_SEC && ticksSinceStart < TICKS_BEFORE_FIRST_SCAN) {
+                if (ticksSinceStart >= TICKS_7_SEC && ticksSinceStart < ticksBeforeFirstScan) {
                     setForwardPressed(client, true);
-                } else if (ticksSinceStart == TICKS_BEFORE_FIRST_SCAN) {
+                } else if (ticksSinceStart == ticksBeforeFirstScan) {
                     setForwardPressed(client, false);
-                    BeamQueueLog.debug("Phase: move ended, first scan at next tick (tick {})", ticksSinceStart);
                 }
-                int nextScanTick = TICKS_BEFORE_FIRST_SCAN + TICKS_7_SEC * scanAttempts;
+                int nextScanTick = ticksBeforeFirstScan + TICKS_7_SEC * scanAttempts;
                 if (scanAttempts < MAX_SCAN_ATTEMPTS && ticksSinceStart == nextScanTick) {
-                    BeamQueueLog.debug("Scan trigger: tick {} (attempt {}), nextScanTick={}", ticksSinceStart, scanAttempts + 1, nextScanTick);
                     runScan(client);
                 }
                 return;
             }
 
-            if (!tournamentSent && ticksSinceStart >= targetSetTick + TICKS_1_SEC) {
+            if (!isValidTargetUsername(targetPlayer)) {
+                BeamQueueLog.warn("Dropping invalid target username: {}", targetPlayer);
+                targetPlayer = null;
+                tournamentSent = false;
+                introReplyWaitActive = false;
+                introReplyWaitTicks = 0;
+                return;
+            }
+
+            if (!tournamentSent && ticksSinceStart >= targetSetTick + TICKS_TARGET_FOLLOWUP_DELAY) {
                 tournamentSent = true;
                 client.player.networkHandler.sendChatCommand("msg " + targetPlayer + " theres a 2v2 sword pvp tournament wanna join?");
                 client.player.sendMessage(Text.literal("Sent invite to " + targetPlayer + "!").formatted(Formatting.GREEN), false);
                 BeamQueueLog.info("Sent tournament invite to target={}", targetPlayer);
+                introReplyWaitActive = true;
+                introReplyWaitTicks = 0;
             }
         });
 
@@ -238,226 +509,239 @@ public class BeamQueueMod implements ClientModInitializer {
             if (inMessageHandler) return;
             inMessageHandler = true;
             try {
-            MinecraftClient client = MinecraftClient.getInstance();
-            if (!active) return;
-            // Detect death messages and queue cooldown
-            if (client.player != null) {
-                String plain = stripFormatting(message.getString());
-                String ourName = client.player.getName().getString();
-                if (isOurDeathMessage(plain, ourName)) {
-                    BeamQueueLog.info("Death message detected in beam session: \"{}\" -> wait 4s then /leave and restart", plain);
-                    deathMessageSeen = true;
-                    deathWaitTicks = 0;
+                MinecraftClient client = MinecraftClient.getInstance();
+                if (!active) return;
+
+                if (client.player != null) {
+                    String plain = stripFormatting(message.getString());
+                    String ourName = client.player.getName().getString();
+                    if (isOurDeathMessage(plain, ourName)) {
+                        deathMessageSeen = true;
+                        deathWaitTicks = 0;
+                        return;
+                    }
+                    int cooldownSec = parseQueueCooldownSeconds(plain);
+                    if (cooldownSec > 0) {
+                        queueCooldownActive = true;
+                        queueCooldownTicks = cooldownSec * 20;
+                        targetPlayer = null;
+                        tournamentSent = false;
+                        setForwardPressed(client, false);
+                        client.player.sendMessage(
+                            Text.literal("Queue cooldown: waiting " + formatCooldown(cooldownSec) + ", then requeuing.").formatted(Formatting.GREEN),
+                            false);
+                        return;
+                    }
+                }
+
+                if (targetPlayer == null || client.player == null) return;
+                String full = normalizeIncomingMessage(message.getString());
+                String fullLower = full.toLowerCase();
+                if (fullLower.startsWith("you ->") || fullLower.startsWith("(to ") || fullLower.startsWith("to ")) return;
+
+                String targetLower = targetPlayer.toLowerCase();
+                String reply = extractReplyFromGameMessage(full, fullLower, targetLower);
+                if (reply == null || reply.isEmpty()) return;
+                markTargetReplied();
+
+                String key = targetPlayer + "|" + reply;
+                long now = System.currentTimeMillis();
+                synchronized (BeamQueueMod.class) {
+                    if (key.equals(lastProcessedMessageKey) && (now - lastProcessedMessageTime) < DEDUPE_MS) return;
+                    lastProcessedMessageKey = key;
+                    lastProcessedMessageTime = now;
+                }
+
+                if (postPositiveActive) {
+                    BeamQueueAiReply.requestReply(reply, targetPlayer);
                     return;
                 }
-                int cooldownSec = parseQueueCooldownSeconds(plain);
-                if (cooldownSec > 0) {
-                    queueCooldownActive = true;
-                    queueCooldownTicks = cooldownSec * 20;
+
+                String replyLower = reply.toLowerCase();
+                if (replyLower.contains("yes") || replyLower.contains("yeah") || replyLower.contains("sure")
+                    || replyLower.contains("ok") || replyLower.contains("join")) {
+                    if (client.player != null) {
+                        sendThrottledPrivateMessage(targetPlayer, buildJoinFollowupMessage());
+                        client.player.sendMessage(
+                            Text.literal("Player interested! Link sent. Waiting 45s for more messages, then leaving...").formatted(Formatting.GREEN),
+                            false);
+                    }
+                    postPositiveActive = true;
+                    postPositiveWaitTicks = 0;
+                } else if (isDeclineReply(replyLower)) {
+                    sendLeaveForCurrentServer(client);
+                    client.player.sendMessage(Text.literal("Target declined. Leaving queue, restarting in 10s...").formatted(Formatting.GREEN), false);
                     targetPlayer = null;
                     tournamentSent = false;
-                    setForwardPressed(client, false);
-                    BeamQueueLog.info("Queue cooldown detected: {}s -> waiting then startBeamAgain", cooldownSec);
-                    client.player.sendMessage(
-                        Text.literal("Queue cooldown: waiting " + formatCooldown(cooldownSec) + ", then requeuing.").formatted(Formatting.GREEN), false);
-                    return;
+                    restartAfterLeave = true;
+                    leaveWaitTicks = 0;
+                } else {
+                    if (!shouldForwardToAi(replyLower)) return;
+                    BeamQueueAiReply.requestReply(reply, targetPlayer);
                 }
-            }
-            if (targetPlayer == null || client.player == null) return;
-            String full = normalizeIncomingMessage(message.getString());
-            BeamQueueLog.debug("GAME message raw: overlay={} text={}", overlay, full);
-            String fullLower = full.toLowerCase();
-            // Ignore our own outgoing messages (e.g. "You -> thekidpika: ...")
-            if (fullLower.startsWith("you ->")) return;
-            String targetLower = targetPlayer.toLowerCase();
-            // Try strict prefixes first, then lenient fallback (target name + "you:" anywhere)
-            String reply = extractReplyFromGameMessage(full, fullLower, targetLower);
-            if (reply == null) {
-                if (fullLower.contains(targetLower)) {
-                    BeamQueueLog.debug("GAME: message contained target '{}' but no reply extracted. Raw: {}", targetPlayer, full);
-                }
-                return;
-            }
-            if (reply.isEmpty()) return;
-            // Dedupe: same message from same target within window (GAME can fire 2–3x; sync for thread safety)
-            String key = targetPlayer + "|" + reply;
-            long now = System.currentTimeMillis();
-            synchronized (BeamQueueMod.class) {
-                if (key.equals(lastProcessedMessageKey) && (now - lastProcessedMessageTime) < DEDUPE_MS) {
-                    BeamQueueLog.debug("GAME: dedupe skip same message from {} within {}ms", targetPlayer, DEDUPE_MS);
-                    return;
-                }
-                lastProcessedMessageKey = key;
-                lastProcessedMessageTime = now;
-            }
-            BeamQueueLog.info("GAME message from target={} reply=\"{}\" (will respond)", targetPlayer, reply);
-            // During 45s post-positive window, forward all target messages to AI (no second join link)
-            if (postPositiveActive) {
-                BeamQueueLog.info("Post-positive: forwarding target message to AI");
-                BeamQueueAiReply.requestReply(reply, targetPlayer);
-                return;
-            }
-            String replyLower = reply.toLowerCase();
-            if (replyLower.contains("yes") || replyLower.contains("yeah") || replyLower.contains("sure")
-                || replyLower.contains("ok") || replyLower.contains("join")) {
-                BeamQueueLog.info("Positive reply -> sending join link, then 45s wait (forward msgs to AI), then leave");
-                if (client.player != null) {
-                    client.player.networkHandler.sendChatCommand(
-                        "msg " + targetPlayer + " join feather-mc [dot] net, add donutskelesz on dc");
-                    client.player.sendMessage(
-                        Text.literal("Player interested! Link sent. Waiting 45s for more messages, then leaving...").formatted(Formatting.GREEN), false);
-                }
-                postPositiveActive = true;
-                postPositiveWaitTicks = 0;
-            } else if (isDeclineReply(replyLower)) {
-                BeamQueueLog.info("Decline reply -> /leave and restart in 10s");
-                client.player.networkHandler.sendChatCommand("leave");
-                client.player.sendMessage(
-                    Text.literal("Target declined. Leaving queue, restarting in 10s...").formatted(Formatting.GREEN), false);
-                targetPlayer = null;
-                tournamentSent = false;
-                restartAfterLeave = true;
-                leaveWaitTicks = 0;
-            } else {
-                // Only send to AI when reply is neither positive nor decline (saves API calls). Also used during 45s post-positive.
-                BeamQueueLog.info("Other reply -> sending to AI for response");
-                BeamQueueAiReply.requestReply(reply, targetPlayer);
-            }
             } finally {
                 inMessageHandler = false;
             }
         });
 
-        // Also handle CHAT – whispers from target, and death messages on some servers
         ClientReceiveMessageEvents.CHAT.register((message, signedMessage, sender, params, receptionTimestamp) -> {
             if (inMessageHandler) return;
             inMessageHandler = true;
             try {
-            MinecraftClient client = MinecraftClient.getInstance();
-            if (!active) return;
-            if (client.player != null) {
-                String plain = stripFormatting(message.getString());
-                String ourName = client.player.getName().getString();
-                if (isOurDeathMessage(plain, ourName)) {
-                    BeamQueueLog.info("Death message (CHAT) detected: \"{}\" -> wait 4s then /leave and restart", plain);
-                    deathMessageSeen = true;
-                    deathWaitTicks = 0;
+                MinecraftClient client = MinecraftClient.getInstance();
+                if (!active) return;
+
+                if (client.player != null) {
+                    String plain = stripFormatting(message.getString());
+                    String ourName = client.player.getName().getString();
+                    if (isOurDeathMessage(plain, ourName)) {
+                        deathMessageSeen = true;
+                        deathWaitTicks = 0;
+                        return;
+                    }
+                    int cooldownSec = parseQueueCooldownSeconds(plain);
+                    if (cooldownSec > 0) {
+                        queueCooldownActive = true;
+                        queueCooldownTicks = cooldownSec * 20;
+                        targetPlayer = null;
+                        tournamentSent = false;
+                        setForwardPressed(client, false);
+                        client.player.sendMessage(
+                            Text.literal("Queue cooldown: waiting " + formatCooldown(cooldownSec) + ", then requeuing.").formatted(Formatting.GREEN),
+                            false);
+                        return;
+                    }
+                }
+
+                if (targetPlayer == null || client.player == null) return;
+                if (sender == null || sender.getName() == null) return;
+                String full = normalizeIncomingMessage(message.getString());
+                String fullLower = full.toLowerCase();
+                if (fullLower.startsWith("you ->") || fullLower.startsWith("(to ") || fullLower.startsWith("to ")) return;
+
+                String senderName = stripFormatting(sender.getName()).trim();
+                if (senderName.isEmpty()) return;
+
+                boolean fromTarget = senderName.equalsIgnoreCase(targetPlayer)
+                    || senderName.toLowerCase().contains(targetPlayer.toLowerCase())
+                    || targetPlayer.toLowerCase().contains(senderName.toLowerCase());
+                if (!fromTarget) return;
+
+                String reply = stripFormatting(message.getString()).trim();
+                if (reply.isEmpty()) return;
+                markTargetReplied();
+
+                String key = targetPlayer + "|" + reply;
+                long now = System.currentTimeMillis();
+                synchronized (BeamQueueMod.class) {
+                    if (key.equals(lastProcessedMessageKey) && (now - lastProcessedMessageTime) < DEDUPE_MS) return;
+                    lastProcessedMessageKey = key;
+                    lastProcessedMessageTime = now;
+                }
+
+                if (postPositiveActive) {
+                    BeamQueueAiReply.requestReply(reply, targetPlayer);
                     return;
                 }
-                int cooldownSec = parseQueueCooldownSeconds(plain);
-                if (cooldownSec > 0) {
-                    queueCooldownActive = true;
-                    queueCooldownTicks = cooldownSec * 20;
+
+                String replyLower = reply.toLowerCase();
+                if (replyLower.contains("yes") || replyLower.contains("yeah") || replyLower.contains("sure")
+                    || replyLower.contains("ok") || replyLower.contains("join")) {
+                    if (client.player != null) {
+                        sendThrottledPrivateMessage(targetPlayer, buildJoinFollowupMessage());
+                        client.player.sendMessage(
+                            Text.literal("Player interested! Link sent. Waiting 45s for more messages, then leaving...").formatted(Formatting.GREEN),
+                            false);
+                    }
+                    postPositiveActive = true;
+                    postPositiveWaitTicks = 0;
+                } else if (isDeclineReply(replyLower)) {
+                    sendLeaveForCurrentServer(client);
+                    client.player.sendMessage(Text.literal("Target declined. Leaving queue, restarting in 10s...").formatted(Formatting.GREEN), false);
                     targetPlayer = null;
                     tournamentSent = false;
-                    setForwardPressed(client, false);
-                    BeamQueueLog.info("Queue cooldown (CHAT) detected: {}s -> waiting then startBeamAgain", cooldownSec);
-                    client.player.sendMessage(
-                        Text.literal("Queue cooldown: waiting " + formatCooldown(cooldownSec) + ", then requeuing.").formatted(Formatting.GREEN), false);
-                    return;
+                    restartAfterLeave = true;
+                    leaveWaitTicks = 0;
+                } else {
+                    if (!shouldForwardToAi(replyLower)) return;
+                    BeamQueueAiReply.requestReply(reply, targetPlayer);
                 }
-            }
-            if (targetPlayer == null || client.player == null) return;
-            if (sender == null || sender.getName() == null) return;
-            String senderName = stripFormatting(sender.getName()).trim();
-            if (senderName.isEmpty()) return;
-            // Exact match or target name contained in sender (e.g. rank prefix "[VIP] Kirambitt") or vice versa
-            boolean fromTarget = senderName.equalsIgnoreCase(targetPlayer)
-                || senderName.toLowerCase().contains(targetPlayer.toLowerCase())
-                || targetPlayer.toLowerCase().contains(senderName.toLowerCase());
-            if (!fromTarget) return;
-            String reply = stripFormatting(message.getString()).trim();
-            if (reply.isEmpty()) return;
-            String key = targetPlayer + "|" + reply;
-            long now = System.currentTimeMillis();
-            synchronized (BeamQueueMod.class) {
-                if (key.equals(lastProcessedMessageKey) && (now - lastProcessedMessageTime) < DEDUPE_MS) {
-                    BeamQueueLog.debug("CHAT: dedupe skip same message from {} within {}ms", targetPlayer, DEDUPE_MS);
-                    return;
-                }
-                lastProcessedMessageKey = key;
-                lastProcessedMessageTime = now;
-            }
-            BeamQueueLog.info("CHAT message from sender={} reply=\"{}\"", sender.getName(), reply);
-            if (postPositiveActive) {
-                BeamQueueLog.info("Post-positive (CHAT): forwarding target message to AI");
-                BeamQueueAiReply.requestReply(reply, targetPlayer);
-                return;
-            }
-            String replyLower = reply.toLowerCase();
-            if (replyLower.contains("yes") || replyLower.contains("yeah") || replyLower.contains("sure")
-                || replyLower.contains("ok") || replyLower.contains("join")) {
-                BeamQueueLog.info("CHAT positive reply -> sending join link, then 45s wait (forward msgs to AI), then leave");
-                if (client.player != null) {
-                    client.player.networkHandler.sendChatCommand(
-                        "msg " + targetPlayer + " join feather-mc [dot] net, add donutskelesz on dc");
-                    client.player.sendMessage(
-                        Text.literal("Player interested! Link sent. Waiting 45s for more messages, then leaving...").formatted(Formatting.GREEN), false);
-                }
-                postPositiveActive = true;
-                postPositiveWaitTicks = 0;
-            } else if (isDeclineReply(replyLower)) {
-                BeamQueueLog.info("CHAT decline reply -> /leave and restart in 10s");
-                client.player.networkHandler.sendChatCommand("leave");
-                client.player.sendMessage(
-                    Text.literal("Target declined. Leaving queue, restarting in 10s...").formatted(Formatting.GREEN), false);
-                targetPlayer = null;
-                tournamentSent = false;
-                restartAfterLeave = true;
-                leaveWaitTicks = 0;
-            } else {
-                BeamQueueLog.info("CHAT other reply -> sending to AI");
-                BeamQueueAiReply.requestReply(reply, targetPlayer);
-            }
             } finally {
                 inMessageHandler = false;
             }
         });
 
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
-            if (restartAfterLeave) {
-                BeamQueueLog.info("Disconnect during leave-restart – keeping state so requeue continues after rejoin");
+            if (restartAfterLeave) return;
+            if (autoReconnectEnabled) {
+                pendingAutoReconnect = true;
+                autoReconnectWaitTicks = 0;
+                captureCurrentServer(client);
+                captureServerFromHandler(handler);
+                BeamQueueLog.info("Disconnected -> scheduling auto reconnect in {}s", (TICKS_AUTO_RECONNECT_DELAY / 20));
                 return;
             }
-            BeamQueueLog.info("Disconnect -> reset");
             reset();
+        });
+
+        HudRenderCallback.EVENT.register((drawContext, tickCounter) -> {
+            MinecraftClient client = MinecraftClient.getInstance();
+            if (client == null || client.textRenderer == null) return;
+            String status = "AI: " + BeamQueueAiReply.getHealthLabel();
+            int color = BeamQueueAiReply.getHealthColor();
+            drawContext.drawText(client.textRenderer, status, 6, 6, color, true);
         });
     }
 
     private static void runScan(MinecraftClient client) {
         ClientPlayerEntity self = client.player;
         if (self == null || client.world == null) return;
+
         int attempt = scanAttempts + 1;
-        BeamQueueLog.info("Scan attempt {} / {} (tick={})", attempt, MAX_SCAN_ATTEMPTS, ticksSinceStart);
         self.sendMessage(Text.literal("Scanning for nearby players... (attempt " + attempt + "/" + MAX_SCAN_ATTEMPTS + ")").formatted(Formatting.GREEN), false);
+
         List<AbstractClientPlayerEntity> players = client.world.getPlayers();
         AbstractClientPlayerEntity nearest = null;
+        String nearestName = null;
         double minSq = MAX_SQ_DISTANCE + 1;
+
         for (AbstractClientPlayerEntity p : players) {
             if (p == self) continue;
+            String candidateName = stripFormatting(p.getName().getString()).trim();
+            if (!isValidTargetUsername(candidateName)) continue;
             double sq = self.squaredDistanceTo(p);
-            BeamQueueLog.debug("  player {} sqDist={}", p.getName().getString(), sq);
             if (sq < minSq && sq < MAX_SQ_DISTANCE) {
                 minSq = sq;
                 nearest = p;
+                nearestName = candidateName;
             }
         }
+
         if (nearest == null) {
             scanAttempts++;
-            BeamQueueLog.info("Scan {}: no player in range (maxSq={})", attempt, MAX_SQ_DISTANCE);
             if (scanAttempts >= MAX_SCAN_ATTEMPTS) {
                 self.sendMessage(Text.literal("No nearby player found after " + MAX_SCAN_ATTEMPTS + " scans!").formatted(Formatting.GREEN), false);
-                BeamQueueLog.info("Max scans reached -> reset");
-                reset();
+                BeamQueueLog.info("No player detected after max scans -> /leave then restart in 10s");
+                setForwardPressed(client, false);
+                sendLeaveForCurrentServer(client);
+                self.sendMessage(Text.literal("No player detected. Leaving and restarting in 10s...").formatted(Formatting.GREEN), false);
+                targetPlayer = null;
+                tournamentSent = false;
+                restartAfterLeave = true;
+                leaveWaitTicks = 0;
             } else {
                 self.sendMessage(Text.literal("No player in range. Retrying in 7s... (" + scanAttempts + "/" + MAX_SCAN_ATTEMPTS + ")").formatted(Formatting.GREEN), false);
             }
             return;
         }
-        targetPlayer = nearest.getName().getString();
+
+        targetPlayer = nearestName;
+        BeamQueueMessagedUsers.recordUsername(targetPlayer);
         targetSetTick = ticksSinceStart;
         tournamentSent = false;
-        BeamQueueLog.info("Scan {}: found target={} (sqDist={})", attempt, targetPlayer, minSq);
+        introReplyWaitActive = false;
+        introReplyWaitTicks = 0;
+
         self.sendMessage(Text.literal("Found " + targetPlayer + "! Messaging...").formatted(Formatting.GREEN), false);
         self.networkHandler.sendChatCommand("msg " + targetPlayer + " hi");
         self.sendMessage(Text.literal("Messaged " + targetPlayer + ": hi").formatted(Formatting.GREEN), false);
@@ -468,65 +752,54 @@ public class BeamQueueMod implements ClientModInitializer {
             KeyBinding key = client.options.forwardKey;
             InputUtil.Key bound = KeyBindingHelper.getBoundKeyOf(key);
             KeyBinding.setKeyPressed(bound, pressed);
-            BeamQueueLog.debug("Forward key set pressed={}", pressed);
         } catch (Exception e) {
             BeamQueueLog.warn("setForwardPressed failed: {}", e.getMessage());
         }
     }
 
-    /** Strip Minecraft § formatting codes so prefix matching works. */
     private static String stripFormatting(String s) {
         if (s == null) return "";
         return s.replaceAll("§[0-9a-fk-or]", "");
     }
 
-    /**
-     * Normalize incoming message: strip § codes and unify arrow variants (→ U+2192, » U+00BB) to ASCII "->"
-     * so "thekidpika → You: when" matches our prefixes.
-     */
     private static String normalizeIncomingMessage(String s) {
         if (s == null) return "";
         s = stripFormatting(s);
-        s = s.replace("\u2192", "->");  // Unicode RIGHTWARDS ARROW (→)
-        s = s.replace("\u00BB", "->");  // Unicode RIGHT-POINTING DOUBLE ANGLE (»)
+        s = s.replace("\u2192", "->");
+        s = s.replace("\u00BB", "->");
         return s;
     }
 
-    /**
-     * Extract reply text from a GAME message from the target. Tries strict prefixes first,
-     * then a lenient fallback: message contains target name and "you:" and takes text after "you:".
-     */
     private static String extractReplyFromGameMessage(String full, String fullLower, String targetLower) {
-        // Strict prefixes (order matters). Arrow already normalized to "->" by normalizeIncomingMessage.
         String[] prefixes = {
             targetLower + " whispers to you: ",
             "[" + targetLower + "] whispers to you: ",
             targetLower + " -> you: ",
             targetLower + " -> you:",
-            targetLower + " » you: ",
-            targetLower + " » you:",
-            targetLower + " -> ",   // e.g. "ItzVelzz » yes" (» normalized to ->)
-            targetLower + " » "
+            "(from " + targetLower + ") ",
+            targetLower + " -> ",
+            targetLower + ":",
+            targetLower + ": "
         };
+
         for (String prefix : prefixes) {
             if (fullLower.contains(prefix)) {
                 int idx = fullLower.indexOf(prefix);
                 return full.substring(idx + prefix.length()).trim();
             }
         }
-        // Lenient: target name appears and "you:" appears – take everything after "you:"
+
         if (!fullLower.contains(targetLower) || !fullLower.contains("you:")) return null;
         int youColon = fullLower.indexOf("you:");
         if (youColon == -1) return null;
         int targetPos = fullLower.indexOf(targetLower);
-        if (targetPos > youColon) return null;  // target must come before "you:"
+        if (targetPos > youColon) return null;
+
         String after = full.substring(youColon + "you:".length()).trim();
         if (after.isEmpty()) return null;
-        BeamQueueLog.debug("GAME: lenient extract after 'you:' -> \"{}\"", after);
         return after;
     }
 
-    /** Negative/decline replies: we handle with /leave, never send to AI. */
     private static boolean isDeclineReply(String replyLower) {
         String t = replyLower.trim();
         if (t.equals("no") || t.equals("nope") || t.equals("nah") || t.equals("na")) return true;
@@ -548,16 +821,186 @@ public class BeamQueueMod implements ClientModInitializer {
         postPositiveWaitTicks = 0;
         timeoutRestartPending = false;
         timeoutRestartTicks = 0;
-        client.player.networkHandler.sendChatCommand("queue sword");
+        introReplyWaitActive = false;
+        introReplyWaitTicks = 0;
+        startBeamEntryAction(client);
+    }
+
+    private static void startBeamEntryAction(MinecraftClient client) {
+        if (client.player == null) return;
+        int moveSeconds = getMoveTicksForServer() / 20;
+        if ("minemen".equalsIgnoreCase(beamServer)) {
+            // 3rd hotbar slot (1-based) is index 2.
+            client.player.getInventory().selectedSlot = 2;
+            if (client.interactionManager != null) {
+                client.interactionManager.interactItem(client.player, Hand.MAIN_HAND);
+            }
+            client.player.sendMessage(
+                Text.literal("Minemen mode: selected slot 3 and right-clicked. Waiting 7s, then moving forward " + moveSeconds + "s, then scanning...")
+                    .formatted(Formatting.GREEN),
+                false);
+            BeamQueueLog.info("/beam start action: minemen (slot3 + right-click)");
+            return;
+        }
+        if ("flowpvp".equalsIgnoreCase(beamServer)) {
+            // 2nd hotbar slot (1-based) is index 1.
+            client.player.getInventory().selectedSlot = 1;
+            if (client.interactionManager != null) {
+                client.interactionManager.interactItem(client.player, Hand.MAIN_HAND);
+            }
+            scheduleFlowPvpQueueClick(FLOWPVP_QUEUE_CLICK_RETRIES, FLOWPVP_QUEUE_INITIAL_DELAY_MS);
+            client.player.sendMessage(
+                Text.literal("FlowPvP mode: selected slot 2, right-clicked, waiting 3s, then queue slot 10. Waiting 7s, then moving forward " + moveSeconds + "s, then scanning...")
+                    .formatted(Formatting.GREEN),
+                false);
+            BeamQueueLog.info("/beam start action: flowpvp (slot2 + right-click + container slot10)");
+            return;
+        }
+        client.player.networkHandler.sendChatCommand("queue " + queueMode);
         client.player.sendMessage(
-            Text.literal("Queued sword! Waiting 7s, then moving forward 6s, then scanning...").formatted(Formatting.GREEN), false);
-        BeamQueueLog.debug("startBeamAgain: state reset, queue sword sent");
+            Text.literal("Queued " + queueMode + "! Waiting 7s, then moving forward " + moveSeconds + "s, then scanning...").formatted(Formatting.GREEN),
+            false);
+        BeamQueueLog.info("/beam start action: mcpvp queue {}", queueMode);
+    }
+
+    private static int getMoveTicksForServer() {
+        return ("minemen".equalsIgnoreCase(beamServer) || "flowpvp".equalsIgnoreCase(beamServer)) ? TICKS_3_SEC : TICKS_6_SEC;
+    }
+
+    private static void scheduleFlowPvpQueueClick(int retriesLeft, long delayMs) {
+        MSG_SCHEDULER.schedule(() -> {
+            MinecraftClient c = MinecraftClient.getInstance();
+            if (c == null) return;
+            c.execute(() -> {
+                if (c.player == null || c.interactionManager == null) return;
+                // Wait until container is open, then right-click container slot index 10.
+                if (c.player.currentScreenHandler != null && c.player.currentScreenHandler != c.player.playerScreenHandler) {
+                    int syncId = c.player.currentScreenHandler.syncId;
+                    c.interactionManager.clickSlot(syncId, FLOWPVP_CONTAINER_SLOT_INDEX, 1, SlotActionType.PICKUP, c.player);
+                    BeamQueueLog.info("FlowPvP queue click sent on container slot {}", FLOWPVP_CONTAINER_SLOT_INDEX + 1);
+                    return;
+                }
+                if (retriesLeft > 0) {
+                    scheduleFlowPvpQueueClick(retriesLeft - 1, FLOWPVP_QUEUE_CLICK_RETRY_MS);
+                } else {
+                    BeamQueueLog.warn("FlowPvP queue click skipped: container did not open in time");
+                }
+            });
+        }, delayMs, TimeUnit.MILLISECONDS);
+    }
+
+    private static void tickAutoReconnect(MinecraftClient client) {
+        if (!autoReconnectEnabled) return;
+        // Connected again; clear reconnect state.
+        if (client.player != null && client.world != null) {
+            pendingAutoReconnect = false;
+            autoReconnectWaitTicks = 0;
+            return;
+        }
+        if (!pendingAutoReconnect) return;
+        autoReconnectWaitTicks++;
+        if (autoReconnectWaitTicks < TICKS_AUTO_RECONNECT_DELAY) return;
+        autoReconnectWaitTicks = 0;
+        if (lastServerAddress == null || lastServerAddress.isBlank()) {
+            BeamQueueLog.warn("Auto reconnect skipped: no known server address");
+            return;
+        }
+        boolean started = tryReconnect(client);
+        if (started) {
+            BeamQueueLog.info("Auto reconnect attempt started -> {}", lastServerAddress);
+        } else {
+            BeamQueueLog.warn("Auto reconnect attempt failed to launch");
+        }
+    }
+
+    private static void captureCurrentServer(MinecraftClient client) {
+        try {
+            Method m = client.getClass().getMethod("getCurrentServerEntry");
+            Object entry = m.invoke(client);
+            if (entry == null) return;
+            Field addrField = entry.getClass().getField("address");
+            Object addrObj = addrField.get(entry);
+            if (addrObj != null) {
+                String addr = String.valueOf(addrObj).trim();
+                if (!addr.isBlank()) lastServerAddress = addr;
+            }
+            try {
+                Field nameField = entry.getClass().getField("name");
+                Object nameObj = nameField.get(entry);
+                if (nameObj != null && !String.valueOf(nameObj).isBlank()) {
+                    lastServerName = String.valueOf(nameObj);
+                }
+            } catch (NoSuchFieldException ignored) {
+                // best effort
+            }
+        } catch (Exception ignored) {
+            // best effort
+        }
+    }
+
+    private static void captureServerFromHandler(Object handler) {
+        if (handler == null) return;
+        if (lastServerAddress != null && !lastServerAddress.isBlank()) return;
+        try {
+            Method getConnection = handler.getClass().getMethod("getConnection");
+            Object connection = getConnection.invoke(handler);
+            if (connection == null) return;
+            Method getAddress = connection.getClass().getMethod("getAddress");
+            Object address = getAddress.invoke(connection);
+            if (address == null) return;
+            String raw = String.valueOf(address).trim();
+            // Typical values: "/host:port" or "host/ip:port". Keep the part after last '/'.
+            if (raw.startsWith("/")) raw = raw.substring(1);
+            int slash = raw.lastIndexOf('/');
+            if (slash >= 0 && slash + 1 < raw.length()) raw = raw.substring(slash + 1);
+            if (!raw.isBlank()) lastServerAddress = raw;
+        } catch (Exception ignored) {
+            // best effort
+        }
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static boolean tryReconnect(MinecraftClient client) {
+        try {
+            Class<?> connectScreenClass = Class.forName("net.minecraft.client.gui.screen.multiplayer.ConnectScreen");
+            Class<?> titleScreenClass = Class.forName("net.minecraft.client.gui.screen.TitleScreen");
+            Class<?> serverAddressClass = Class.forName("net.minecraft.client.network.ServerAddress");
+            Class<?> serverInfoClass = Class.forName("net.minecraft.client.network.ServerInfo");
+            Class<?> serverTypeClass = Class.forName("net.minecraft.client.network.ServerInfo$ServerType");
+
+            Method parse = serverAddressClass.getMethod("parse", String.class);
+            Object address = parse.invoke(null, lastServerAddress);
+            Object serverTypeOther = Enum.valueOf((Class<Enum>) serverTypeClass, "OTHER");
+            Constructor<?> infoCtor = serverInfoClass.getConstructor(String.class, String.class, serverTypeClass);
+            Object info = infoCtor.newInstance(lastServerName, lastServerAddress, serverTypeOther);
+            Object title = titleScreenClass.getConstructor().newInstance();
+
+            for (Method method : connectScreenClass.getMethods()) {
+                if (!method.getName().equals("connect")) continue;
+                Class<?>[] pt = method.getParameterTypes();
+                if (pt.length < 4) continue;
+                Object[] args = new Object[pt.length];
+                for (int i = 0; i < pt.length; i++) {
+                    Class<?> t = pt[i];
+                    if (t.isInstance(title)) args[i] = title;
+                    else if (t.isInstance(client)) args[i] = client;
+                    else if (t.equals(serverAddressClass)) args[i] = address;
+                    else if (t.equals(serverInfoClass)) args[i] = info;
+                    else if (t.equals(boolean.class) || t.equals(Boolean.class)) args[i] = false;
+                    else args[i] = null;
+                }
+                method.invoke(null, args);
+                return true;
+            }
+        } catch (Exception e) {
+            BeamQueueLog.warn("Auto reconnect error: {}", e.getMessage());
+        }
+        return false;
     }
 
     private static void reset() {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client != null) setForwardPressed(client, false);
-        BeamQueueLog.debug("reset: active=false, target=null, ticks=0");
         active = false;
         targetPlayer = null;
         ticksSinceStart = 0;
@@ -573,20 +1016,25 @@ public class BeamQueueMod implements ClientModInitializer {
         postPositiveWaitTicks = 0;
         timeoutRestartPending = false;
         timeoutRestartTicks = 0;
+        introReplyWaitActive = false;
+        introReplyWaitTicks = 0;
         lastProcessedMessageKey = null;
     }
 
-    /** Parse queue cooldown message (e.g. "You are on queue cooldown for 6m, 54s due to..."). Returns total seconds or 0. */
     private static int parseQueueCooldownSeconds(String message) {
         if (message == null) return 0;
         String lower = message.toLowerCase();
         if (!lower.contains("queue cooldown") && !lower.contains("cooldown for")) return 0;
+
         int minutes = 0;
         int seconds = 0;
+
         Matcher mMin = Pattern.compile("(\\d+)\\s*m").matcher(lower);
         if (mMin.find()) minutes = Integer.parseInt(mMin.group(1));
+
         Matcher mSec = Pattern.compile("(\\d+)\\s*s").matcher(lower);
         if (mSec.find()) seconds = Integer.parseInt(mSec.group(1));
+
         int total = minutes * 60 + seconds;
         return total > 0 ? total : 0;
     }
@@ -599,16 +1047,163 @@ public class BeamQueueMod implements ClientModInitializer {
         return s + "s";
     }
 
-    /** True if message is a death message for the given player name (e.g. "X was slain by Y"). */
+    private static void sendLeaveForCurrentServer(MinecraftClient client) {
+        if (client == null || client.player == null) return;
+        client.player.networkHandler.sendChatCommand("leave");
+        if (!"flowpvp".equalsIgnoreCase(beamServer)) return;
+        MSG_SCHEDULER.schedule(() -> {
+            MinecraftClient c = MinecraftClient.getInstance();
+            if (c == null) return;
+            c.execute(() -> {
+                if (c.player != null) {
+                    c.player.networkHandler.sendChatCommand("leave");
+                }
+            });
+        }, FLOWPVP_LEAVE_SECOND_DELAY_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private static void sendLeaveTwiceWithDelay(MinecraftClient client) {
+        if (client == null || client.player == null) return;
+        client.player.networkHandler.sendChatCommand("leave");
+        MSG_SCHEDULER.schedule(() -> {
+            MinecraftClient c = MinecraftClient.getInstance();
+            if (c == null) return;
+            c.execute(() -> {
+                if (c.player != null) {
+                    c.player.networkHandler.sendChatCommand("leave");
+                }
+            });
+        }, FLOWPVP_LEAVE_SECOND_DELAY_MS, TimeUnit.MILLISECONDS);
+    }
+
     private static boolean isOurDeathMessage(String message, String ourName) {
         if (message == null || ourName == null || ourName.isEmpty()) return false;
         String lower = message.toLowerCase();
         String nameLower = ourName.toLowerCase();
         if (!lower.contains(nameLower)) return false;
+
         return lower.contains(" was slain by") || lower.contains(" was killed by") || lower.contains(" was burnt")
             || lower.contains(" fell from") || lower.contains(" drowned") || lower.contains(" went up in flames")
             || lower.contains(" was blown up") || lower.contains(" hit the ground") || lower.contains(" was shot")
             || lower.contains(" was fireballed") || lower.contains(" was pricked") || lower.contains(" was squashed")
             || lower.contains(" was struck by lightning") || lower.contains(" was slain");
+    }
+
+    public static void handleAiDecline(String target, String aiReply) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.player == null) return;
+
+        if (target != null && !target.isBlank() && aiReply != null && !aiReply.isBlank()) {
+            sendThrottledPrivateMessage(target, aiReply);
+        }
+
+        sendLeaveForCurrentServer(client);
+        client.player.sendMessage(
+            Text.literal("Target declined (AI). Leaving queue, restarting in 10s...").formatted(Formatting.GREEN),
+            false);
+
+        targetPlayer = null;
+        tournamentSent = false;
+        introReplyWaitActive = false;
+        introReplyWaitTicks = 0;
+        restartAfterLeave = true;
+        leaveWaitTicks = 0;
+    }
+
+    public static void sendThrottledPrivateMessage(String target, String text) {
+        if (target == null || target.isBlank() || text == null || text.isBlank()) return;
+        if (!isValidTargetUsername(target)) {
+            BeamQueueLog.warn("Skipped private message due to invalid target username: {}", target);
+            return;
+        }
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.player == null) return;
+
+        long now = System.currentTimeMillis();
+        long delta = now - lastPrivateMsgAt;
+        long delayMs = delta >= PRIVATE_MSG_GAP_MS ? 0L : (PRIVATE_MSG_GAP_MS - delta);
+        lastPrivateMsgAt = now + delayMs;
+
+        Runnable sendTask = () -> {
+            MinecraftClient c = MinecraftClient.getInstance();
+            if (c == null) return;
+            c.execute(() -> {
+                if (c.player != null) {
+                    c.player.networkHandler.sendChatCommand("msg " + target + " " + text);
+                }
+            });
+        };
+
+        if (delayMs == 0L) {
+            sendTask.run();
+            return;
+        }
+        MSG_SCHEDULER.schedule(sendTask, delayMs, TimeUnit.MILLISECONDS);
+    }
+
+    public static String getServerIpPlain() {
+        return sanitizeCommandValue(serverIpPlain);
+    }
+
+    public static String getServerIpMasked() {
+        return maskDots(getServerIpPlain());
+    }
+
+    public static String getDiscordInvitePlain() {
+        return sanitizeCommandValue(discordInvitePlain);
+    }
+
+    public static String getDiscordInviteMasked() {
+        return maskDots(getDiscordInvitePlain());
+    }
+
+    public static boolean isShareModeDiscord() {
+        return "discord".equalsIgnoreCase(shareMode);
+    }
+
+    public static String getShareTargetPlain() {
+        return isShareModeDiscord() ? getDiscordInvitePlain() : getServerIpPlain();
+    }
+
+    public static String getShareTargetMasked() {
+        return isShareModeDiscord() ? getDiscordInviteMasked() : getServerIpMasked();
+    }
+
+    private static String buildJoinFollowupMessage() {
+        return "join " + getShareTargetMasked() + " for the tournament quick it starts in 10 mins";
+    }
+
+    private static boolean shouldForwardToAi(String replyLower) {
+        if (replyLower == null) return false;
+        String t = replyLower.trim();
+        if (t.isEmpty()) return false;
+        // Ignore very short / filler chat so AI doesn't send awkward auto-replies like "alr bet".
+        return !(t.equals("gg") || t.equals("g") || t.equals("ok") || t.equals("k") || t.equals("kk")
+            || t.equals("hi") || t.equals("yo") || t.equals("sup") || t.equals("lol")
+            || t.equals("lmao") || t.equals("bruh") || t.equals("hmm"));
+    }
+
+    private static boolean isValidTargetUsername(String username) {
+        if (username == null) return false;
+        String trimmed = stripFormatting(username).trim();
+        return MINECRAFT_USERNAME_PATTERN.matcher(trimmed).matches();
+    }
+
+    private static void markTargetReplied() {
+        introReplyWaitActive = false;
+        introReplyWaitTicks = 0;
+    }
+
+    private static String sanitizeCommandValue(String raw) {
+        if (raw == null) return "";
+        String out = raw.trim();
+        out = out.replaceAll("\\s*/\\s*", "/");
+        out = out.replaceAll("\\s+", " ");
+        return out;
+    }
+
+    private static String maskDots(String input) {
+        if (input == null) return "";
+        return input.replace(".", " [dot] ");
     }
 }

@@ -22,10 +22,10 @@ public final class BeamQueueConfig {
     private static final String KEY_OPENAI_API_URL = "openai_api_url";
     private static final String KEY_MODEL = "model";
     private static final String KEY_DEBUG = "debug";
-    /** g4f.space Groq endpoint (g4f.dev returns 405 for server-side requests). No API key required. */
-    private static final String DEFAULT_API_URL = "https://g4f.space/api/groq/v1/chat/completions";
+    /** g4f.space OpenAI-compatible endpoint. */
+    private static final String DEFAULT_API_URL = "https://g4f.space/api/v1/chat/completions";
     /** Hardcoded g4f.dev API key (override with config or env if needed). */
-    private static final String HARDCODED_API_KEY = "g4f_u_mm3dtj_0791feb27c48700d17de45c6c35d43530844857daa2e4782_2b585d83";
+    private static final String HARDCODED_API_KEY = "g4f_u_mm3dtj_731391ec3875d2f03e5e6ed43c2feb0d48b099df8eaa9de2_6a6aaef4";
 
     private static String apiKey;
     private static String apiUrl;
@@ -42,15 +42,23 @@ public final class BeamQueueConfig {
         return (apiUrl != null && !apiUrl.isBlank()) ? apiUrl : DEFAULT_API_URL;
     }
 
-    /** AI model name. Default: Groq Llama 4. Config key: model */
+    /** AI model name. Empty by default so provider can auto-select. Config key: model */
     public static String getModel() {
         ensureLoaded();
-        return (model != null && !model.isBlank()) ? model : "meta-llama/llama-4-maverick-17b-128e-instruct";
+        return (model != null && !model.isBlank()) ? model : "";
     }
 
     public static boolean hasApiKey() {
         ensureLoaded();
         return apiKey != null && !apiKey.isBlank();
+    }
+
+    public static synchronized boolean setApiKey(String newApiKey) {
+        String normalized = newApiKey == null ? "" : newApiKey.trim();
+        if (normalized.isBlank()) return false;
+        ensureLoaded();
+        apiKey = normalized;
+        return saveApiKeyToConfig(normalized);
     }
 
     private static void ensureLoaded() {
@@ -81,5 +89,37 @@ public final class BeamQueueConfig {
             if (debugVal != null) BeamQueueLog.setDebugEnabled("true".equalsIgnoreCase(debugVal.trim()));
         }
         if (apiKey == null || apiKey.isBlank()) apiKey = HARDCODED_API_KEY;
+    }
+
+    private static boolean saveApiKeyToConfig(String key) {
+        Path configPath = getConfigPath();
+        Properties p = new Properties();
+        if (Files.isRegularFile(configPath)) {
+            try (var in = Files.newInputStream(configPath)) {
+                p.load(in);
+            } catch (IOException e) {
+                BeamQueueLog.warn("Failed reading existing config before writing API key: {}", e.getMessage());
+            }
+        }
+        p.setProperty(KEY_API_KEY, key);
+        p.remove(KEY_OPENAI_API_KEY);
+        try {
+            Files.createDirectories(configPath.getParent());
+            try (var out = Files.newOutputStream(configPath)) {
+                p.store(out, "Beam Queue config");
+            }
+            return true;
+        } catch (IOException e) {
+            BeamQueueLog.warn("Failed writing API key to config: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    private static Path getConfigPath() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        Path runDir = (mc != null && mc.runDirectory != null)
+            ? mc.runDirectory.toPath()
+            : Path.of(".");
+        return runDir.resolve(CONFIG_DIR).resolve(CONFIG_FILE);
     }
 }

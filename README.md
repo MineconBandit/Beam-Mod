@@ -1,103 +1,164 @@
-# Beam Queue
+﻿# 🚀 Beam Queue (Fabric Client Mod)
 
-Client-side Fabric mod for Minecraft 1.21.4 that automates queuing for sword PvP and messaging nearby players for 2v2 tournaments.
+<u>Automated queue + player messaging assistant for PvP servers (Minecraft 1.21.4).</u>
 
-- **Mod ID:** `beamqueue`
-- **Version:** 1.0.0
-- **Client-side only;** no server dependency.
+## ✨ What This Mod Does
 
-## Requirements
+- Starts queue flow automatically.
+- Finds a nearby player and sends intro + tournament invite.
+- Handles replies with smart logic (yes/no/AI).
+- Requeues automatically after leave, timeout, death, or cooldown.
+- Shows AI health on-screen (`AI: Working / Not Working / No API Key`).
 
-- Minecraft 1.21.4
-- Fabric Loader 0.16.7+
-- Fabric API
-- Java 21
+## 📦 Requirements
 
-## Build & run
+- **Minecraft:** `1.21.4`
+- **Loader:** `Fabric Loader 0.16.7+`
+- **Dependency:** `Fabric API`
+- **Java:** `21`
 
-**Gradle wrapper:** If `gradlew` or `gradlew.bat` fails (e.g. missing `gradle/wrapper/gradle-wrapper.jar`), install [Gradle](https://gradle.org/install/) and run in the project root: `gradle wrapper`. Or use the [Fabric template generator](https://fabricmc.net/develop/template/) and copy the `gradle/wrapper` folder and `gradlew`/`gradlew.bat` into this project.
+## 🛠️ Build & Run
 
-**Java version:** The mod is built for Java 21. If you see `Unsupported class file major version 69`, one of the build plugins was compiled with a newer JDK—try setting `JAVA_HOME` to JDK 21 when running Gradle, or use a JDK that supports the required class file version.
-
-### Generate Minecraft sources (for IDE)
-
-```bash
-./gradlew genSources
-```
-
-On Windows:
-
-```bash
-.\gradlew.bat genSources
-```
-
-### Run the game with the mod
-
-```bash
-./gradlew runClient
-```
-
-On Windows:
+### Windows
 
 ```bash
 .\gradlew.bat runClient
+.\gradlew.bat build
 ```
 
-### Build the JAR
+### Linux / macOS
 
 ```bash
+./gradlew runClient
 ./gradlew build
 ```
 
-Output: `build/libs/beamqueue-1.0.0.jar`
+Output JAR: `build/libs/beamqueue-1.0.0.jar`
 
-Install Fabric for 1.21.4, put this JAR and [Fabric API](https://modrinth.com/mod/fabric-api) in your `mods` folder, then launch the game.
+## ▶️ Quick Start
 
-## Usage
+1. Join your server.
+2. Run `/beam`.
+3. Beam flow: enter queue, move, scan, message target, then auto-handle replies.
 
-1. Join a server (e.g. Hypixel or a local server).
-2. In chat, run: `/beam`
-3. The mod will:
-   - Send `/queue sword`
-   - After **7 seconds**, move forward **6 seconds**, then scan for the nearest player within 50 blocks (up to **4 scans** at 13s, 20s, 27s, 34s if no one is found)
-   - Message them "hi", then 1s later the 2v2 tournament invite
-   - Listen for **all** whispers from that player:
-- **Positive** ("yes", "sure", "join", etc.) → send short join link (`join feather-mc [dot] net, add donutskelesz on dc`), then **immediately** `/leave`, wait 5s and restart from `/queue sword`
-   - **Anything else** → if an OpenAI API key is set, the mod uses AI to reply with event info (when: 20 mins, where: feather-mc [dot] net, how many: ~50, Discord: donutskelesz)
-   - Time out after **90 seconds** if nothing happens
+## 🎮 Modes
 
-Only one `/beam` run is active at a time. State resets on disconnect or world change. If you **die** while beam is active (mod detects chat messages like "X was slain by Y"), it waits 4s, runs `/leave`, then 5s and restarts. If you see **queue cooldown** (e.g. "You are on queue cooldown for 6m, 54s due to leaving the match too often"), the mod waits that full duration then runs `startBeamAgain` (requeue).
+### <u>Beam Server Mode</u>
 
-### AI replies (optional, g4f.dev)
+Commands:
 
-The mod uses the [g4f.dev](https://github.com/gpt4free/g4f.dev) API. Defaults: **`https://g4f.space/api/groq/v1/chat/completions`** with model **`meta-llama/llama-4-maverick-17b-128e-instruct`** (Groq Llama 4; no API key required). Use g4f.space for server-side requests—g4f.dev often returns **405** for non-browser requests.
+- `/beamserver mcpvp`
+- `/beamserver minemen`
+- `/beamserver flowpvp`
 
-To enable AI-powered answers (e.g. "when's the event?", "where?", "discord?"):
+Function:
 
-- The mod uses a hardcoded API key by default; you can override via **`<game-dir>/config/beamqueue.properties`** or env **`BEAMQUEUE_API_KEY`**.
-- Optional in config: `api_url=...`, `model=...` (default URL and model above).
+- **mcpvp:** runs `/queue <queueMode>`
+- **minemen:** selects hotbar slot 3 and right-clicks
+- **flowpvp:** selects hotbar slot 2, right-clicks, then clicks container slot 10
 
-Without a valid API key, the mod still works: it only auto-replies to positive answers with the join link; other messages use fallback replies when the API fails.
+### <u>Share Mode</u>
 
-**Why the AI might return 500 or fail**
+Commands:
 
-- **Service down / Cloudflare** – You may see `status=500` and an HTML body; the mod falls back to hardcoded answers.
-- **405 Not Allowed** – g4f.dev may reject non-browser requests. Use `api_url=https://g4f.space/api/groq/v1/chat/completions` (default).
-- **404 / wrong model** – Use the default Groq URL and model, or set `api_url` and `model` in config to match a supported endpoint.
-- **Rate limiting** – The mod falls back to hardcoded answers when the API fails.
+- `/changemode ip <server-ip>`
+- `/changemode discord <invite>`
 
-### Debugging and logging
+Function:
 
-The mod logs to the **BeamQueue** logger. In your game folder, check **`logs/latest.log`** (or the launcher’s log file).
+- **ip mode:** shares server IP
+- **discord mode:** shares Discord invite
+- Dots are masked to `[dot]` in chat
 
-- **Normal runs:** Important events are logged (e.g. `/beam` started, scan attempts, target found, GAME/CHAT message from target, positive/decline/AI, disconnect).
-- **Verbose debug:** Set **`debug=true`** in `config/beamqueue.properties` or env **`BEAMQUEUE_DEBUG=true`** to get extra logs: tick phase, world null pause, prefix match failures, forward key, scan distances, AI API status/length.
+### <u>Queue Mode</u>
 
-## Development
+Command:
 
-- **VS Code:** Open the project folder; use Java Extension Pack and Gradle for Java. Run `genSources` then use Gradle tasks: `runClient`, `build`.
-- **IntelliJ:** Import as Gradle project, run `genSources`, then use the Gradle tool window to run `runClient` or `build`.
+- `/changequeue <mode>`
 
-## License
+Function:
+
+- Used by `mcpvp` server mode as `/queue <mode>`
+- Default queue mode is `sword`
+
+### <u>Auto Reconnect Mode</u>
+
+Commands:
+
+- `/autoreconnect on`
+- `/autoreconnect off`
+
+Function:
+
+- If disconnected unexpectedly, reconnect attempt starts after ~10s
+
+## 🤖 AI Mode
+
+AI handles non-yes/non-decline target replies.
+
+- HUD status is shown in top-left
+- Health checks run automatically
+- Temporary API issues do not instantly flip to red status
+
+### <u>API Key (Persistent)</u>
+
+Command:
+
+- `/apikey <your-g4f-key>`
+
+Function:
+
+- Sets API key immediately for current session
+- Saves API key to `config/beamqueue.properties`
+- Reuses saved key on future launches
+- Triggers immediate AI health re-check
+
+Config/env options:
+
+- `config/beamqueue.properties`
+- `BEAMQUEUE_API_KEY`
+- `BEAMQUEUE_OPENAI_API_KEY`
+
+## 💬 Commands Reference
+
+- `/beam` -> start automation
+- `/beamstop` -> stop automation
+- `/changequeue <mode>` -> set queue mode
+- `/beamserver <mcpvp|minemen|flowpvp>` -> set server behavior mode
+- `/changemode ip <value>` -> use IP share mode
+- `/changemode discord <value>` -> use Discord share mode
+- `/changeip <ip>` -> update stored IP without switching share mode
+- `/autoreconnect <on|off>` -> toggle reconnect mode
+- `/apikey <key>` -> set and persist API key
+
+## 🧠 Reply Logic
+
+When target replies:
+
+- **Positive** (`yes`, `sure`, `join`, etc.) -> sends join follow-up, waits ~45s, then leaves and requeues
+- **Decline** (`no`, `nah`, `later`, `im good`, etc.) -> leaves and requeues in ~10s
+- **Other** -> forwards message to AI and replies naturally
+
+Safety helpers:
+
+- Duplicate message dedupe
+- Private message throttle
+- Very short filler messages are ignored in AI path
+
+## ⏱️ Automatic Recovery Rules
+
+- No target after max scans -> leave + restart
+- No reply after invite for 30s -> leave + restart
+- Beam timeout around 90s -> restart
+- Death detected -> leave + restart
+- Queue cooldown detected -> wait full cooldown, then requeue
+
+## 🧾 Logging / Debug
+
+- Logs: `logs/latest.log`
+- Enable debug with env: `BEAMQUEUE_DEBUG=true`
+- Or set `debug=true` in `config/beamqueue.properties`
+
+## 📄 License
 
 CC0-1.0
