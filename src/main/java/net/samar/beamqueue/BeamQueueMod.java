@@ -693,14 +693,7 @@ public class BeamQueueMod implements ClientModInitializer {
                 String replyLower = reply.toLowerCase();
                 if (replyLower.contains("yes") || replyLower.contains("yeah") || replyLower.contains("sure")
                     || replyLower.contains("ok") || replyLower.contains("join")) {
-                    if (client.player != null) {
-                        sendThrottledPrivateMessage(targetPlayer, buildJoinFollowupMessage());
-                        client.player.sendMessage(
-                            Text.literal("Player interested! Link sent. Waiting 45s for more messages, then leaving...").formatted(Formatting.GREEN),
-                            false);
-                    }
-                    postPositiveActive = true;
-                    postPositiveWaitTicks = 0;
+                    handlePositiveInterestReply(client);
                 } else if (isDeclineReply(replyLower)) {
                     sendLeaveForCurrentServer(client);
                     client.player.sendMessage(Text.literal("Target declined. Leaving queue, restarting in 10s...").formatted(Formatting.GREEN), false);
@@ -781,14 +774,7 @@ public class BeamQueueMod implements ClientModInitializer {
                 String replyLower = reply.toLowerCase();
                 if (replyLower.contains("yes") || replyLower.contains("yeah") || replyLower.contains("sure")
                     || replyLower.contains("ok") || replyLower.contains("join")) {
-                    if (client.player != null) {
-                        sendThrottledPrivateMessage(targetPlayer, buildJoinFollowupMessage());
-                        client.player.sendMessage(
-                            Text.literal("Player interested! Link sent. Waiting 45s for more messages, then leaving...").formatted(Formatting.GREEN),
-                            false);
-                    }
-                    postPositiveActive = true;
-                    postPositiveWaitTicks = 0;
+                    handlePositiveInterestReply(client);
                 } else if (isDeclineReply(replyLower)) {
                     sendLeaveForCurrentServer(client);
                     client.player.sendMessage(Text.literal("Target declined. Leaving queue, restarting in 10s...").formatted(Formatting.GREEN), false);
@@ -953,6 +939,34 @@ public class BeamQueueMod implements ClientModInitializer {
             || replyLower.contains("im bad") || replyLower.contains("very bad") || replyLower.contains("i'm bad")
             || replyLower.startsWith("na ") || replyLower.endsWith(" na")
             || replyLower.contains("no way") || replyLower.contains("not interested") || replyLower.contains("pass");
+    }
+
+    private static void handlePositiveInterestReply(MinecraftClient client) {
+        if (client == null || client.player == null || targetPlayer == null) return;
+
+        sendThrottledPrivateMessage(targetPlayer, buildJoinFollowupMessage());
+
+        if ("catpvp".equalsIgnoreCase(beamServer)) {
+            sendThrottledPrivateMessage(targetPlayer, "alr im disconnecting now and hopping on server, join quick");
+            client.player.sendMessage(
+                Text.literal("Player interested! Link sent. Announced disconnect, leaving now, then requeueing in 10s...")
+                    .formatted(Formatting.GREEN),
+                false);
+            postPositiveActive = false;
+            postPositiveWaitTicks = 0;
+            sendLeaveForCurrentServer(client);
+            targetPlayer = null;
+            tournamentSent = false;
+            restartAfterLeave = true;
+            leaveWaitTicks = 0;
+            return;
+        }
+
+        client.player.sendMessage(
+            Text.literal("Player interested! Link sent. Waiting 45s for more messages, then leaving...").formatted(Formatting.GREEN),
+            false);
+        postPositiveActive = true;
+        postPositiveWaitTicks = 0;
     }
 
     private static void startBeamAgain(MinecraftClient client) {
