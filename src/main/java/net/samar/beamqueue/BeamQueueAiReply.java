@@ -22,8 +22,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class BeamQueueAiReply {
 
-    /** Default: Groq Llama 4 Maverick (meta-llama/llama-4-maverick-17b-128e-instruct). */
-    private static final String DEFAULT_MODEL = "gpt-4o-mini";
+    private static final String AUTO_API_URL = "https://g4f.space/api/auto/chat/completions";
 
     private static final ExecutorService EXECUTOR = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "beamqueue-ai");
@@ -54,6 +53,8 @@ public final class BeamQueueAiReply {
     private static final int HEALTH_CHECK_INITIAL_DELAY_SEC = 5;
     private static final int HEALTH_CHECK_INTERVAL_SEC = 120;
     private static final int HEALTH_FAILURES_FOR_DOWN = 3;
+    private static final int RATE_LIMIT_DEFAULT_BACKOFF_MS = 60000;
+    private static final int RATE_LIMIT_HEALTH_COLOR = 0xFFAA33;
     /** Skip sending the same reply to the same target within this window (stops duplicate sends). */
     private static final long SEND_DEDUPE_MS = 4000L;
     private static final int RECENT_REPLY_HISTORY = 8;
@@ -65,6 +66,7 @@ public final class BeamQueueAiReply {
     private static int recentRepliesCursor = 0;
     private static int variationCursor = 0;
     private static long lastApiCallTime = 0L;
+    private static volatile long rateLimitedUntilMs = 0L;
 
     public static void startHealthChecks() {
         if (!HEALTH_STARTED.compareAndSet(false, true)) return;
@@ -98,15 +100,23 @@ public final class BeamQueueAiReply {
     }
 
     public static void requestReply(String userMessage, String targetPlayer) {
-        // Groq endpoint doesn't require API key; others do
-        if (!BeamQueueConfig.hasApiKey() && !isGroqEndpoint()) {
-            BeamQueueLog.warn("AI reply skipped: no API key");
-            return;
-        }
         BeamQueueLog.info("AI request: target={} message=\"{}\"", targetPlayer, userMessage);
 
         EXECUTOR.submit(() -> {
             try {
+                if (isRateLimitedNow()) {
+                    BeamQueueLog.warn("AI request skipped due to active rate-limit backoff");
+                    String fallback = getFallbackReply(userMessage);
+                    if (fallback == null || fallback.isBlank()) return;
+                    String ft = targetPlayer;
+                    String toSend = ensureVariedReply(sanitizeForChat(fallback), userMessage);
+                    MinecraftClient.getInstance().execute(() -> {
+                        if (BeamQueueMod.targetPlayer != null && BeamQueueMod.targetPlayer.equals(ft)) {
+                            sendMsg(ft, toSend);
+                        }
+                    });
+                    return;
+                }
                 String raw = callApi(userMessage);
                 if (raw == null || raw.isBlank()) {
                     raw = getFallbackReply(userMessage);
@@ -119,6 +129,9 @@ public final class BeamQueueAiReply {
                 }
                 AiIntent intent = extractIntent(raw, userMessage);
                 String parsedReply = extractReplyText(raw);
+                if (parsedReply == null || parsedReply.isBlank()) {
+                    parsedReply = getFallbackReply(userMessage);
+                }
                 String toSend = ensureVariedReply(sanitizeForChat(parsedReply), userMessage);
                 BeamQueueLog.info("AI reply ({} chars): \"{}\"", toSend.length(), toSend);
                 String finalTarget = targetPlayer;
@@ -152,9 +165,9 @@ public final class BeamQueueAiReply {
     }
 
     private static void runHealthCheck() {
-        if (!BeamQueueConfig.hasApiKey() && !isGroqEndpoint()) {
+        if (isRateLimitedNow()) {
             consecutiveHealthFailures = 0;
-            setHealth("No API Key", 0xFFD76A);
+            setHealth("Rate Limited", RATE_LIMIT_HEALTH_COLOR);
             return;
         }
         try {
@@ -205,28 +218,18 @@ public final class BeamQueueAiReply {
         return "join " + shareTarget + " in 20 mins";
     }
 
-    private static boolean isGroqEndpoint() {
-        String u = BeamQueueConfig.getApiUrl();
-        return u != null && u.contains("groq");
-    }
-
     private static String callApi(String userMessage) throws Exception {
         return callApi(userMessage, MAX_RETRIES);
     }
 
     private static String callApi(String userMessage, int maxRetries) throws Exception {
-        String url = BeamQueueConfig.getApiUrl();
-        String modelName = BeamQueueConfig.getModel();
+        String url = AUTO_API_URL;
         String systemPrompt = buildSystemPrompt();
         enforceApiGap();
-        // Match working JS: stream: true, stream_options; if model is blank, omit it so provider can auto-select.
-        String modelPart = (modelName != null && !modelName.isBlank())
-            ? "\"model\":\"" + escapeJson(modelName) + "\","
-            : "";
-        String body = "{" + modelPart + "\"messages\":[" +
+        String body = "{\"messages\":[" +
             "{\"role\":\"system\",\"content\":\"" + escapeJson(systemPrompt) + "\"}," +
             "{\"role\":\"user\",\"content\":\"" + escapeJson(userMessage) + "\"}" +
-            "],\"stream\":true,\"stream_options\":{\"include_usage\":true}}";
+            "],\"stream\":false}";
 
         HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(url))
             .header("Accept", "*/*")
@@ -242,41 +245,68 @@ public final class BeamQueueAiReply {
             .header("sec-fetch-site", "same-origin")
             .timeout(Duration.ofSeconds(20))
             .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8));
-        // Groq endpoint does not use Authorization (per working JS)
-        if (!isGroqEndpoint() && BeamQueueConfig.hasApiKey()) {
-            builder.header("Authorization", "Bearer " + BeamQueueConfig.getOpenAiApiKey());
-        }
         HttpRequest req = builder.build();
 
         for (int attempt = 1; attempt <= maxRetries; attempt++) {
             HttpResponse<String> res = HTTP.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-            BeamQueueLog.debug("AI API model={} attempt {} status={} bodyLength={}", modelName, attempt, res.statusCode(), res.body().length());
+            BeamQueueLog.debug("AI API attempt {} status={} bodyLength={}", attempt, res.statusCode(), res.body().length());
             if (res.statusCode() == 200) {
-                String content = extractStreamedContent(res.body());
+                String content = extractContentFromAnyShape(res.body());
                 if (content != null && !content.isBlank()) return content;
-                BeamQueueLog.warn("AI API returned empty streamed content (model={})", modelName);
+                BeamQueueLog.warn("AI API returned empty content");
                 return null;
             }
-            if (res.statusCode() == 429 || res.statusCode() == 500) {
-                int retryDelayMs = computeRetryDelayMs(attempt);
+            if (res.statusCode() == 429) {
                 int retryAfterMs = parseRetryAfterMillis(res);
-                int effectiveDelayMs = Math.max(retryDelayMs, retryAfterMs);
+                int backoffMs = retryAfterMs > 0 ? retryAfterMs : RATE_LIMIT_DEFAULT_BACKOFF_MS;
+                markRateLimited(backoffMs);
+                String bodyPreview = res.body().length() > 200 ? res.body().substring(0, 200) + "..." : res.body();
+                BeamQueueLog.warn("AI API 429 rate-limited: backing off for {}ms. body={}", backoffMs, bodyPreview);
+                return null;
+            }
+            if (res.statusCode() == 500) {
+                int retryDelayMs = computeRetryDelayMs(attempt);
+                int effectiveDelayMs = retryDelayMs;
                 if (attempt < maxRetries) {
-                    BeamQueueLog.warn("AI API {} (model={} attempt {}/{}), retrying in {}ms", res.statusCode(), modelName, attempt, maxRetries, effectiveDelayMs);
+                    BeamQueueLog.warn("AI API {} (attempt {}/{}), retrying in {}ms", res.statusCode(), attempt, maxRetries, effectiveDelayMs);
                     Thread.sleep(effectiveDelayMs);
                 } else {
-                    BeamQueueLog.warn("AI API {} (model={} attempt {}/{}), retries exhausted", res.statusCode(), modelName, attempt, maxRetries);
+                    BeamQueueLog.warn("AI API {} (attempt {}/{}), retries exhausted", res.statusCode(), attempt, maxRetries);
                 }
                 continue;
             }
             String bodyPreview = res.body().length() > 200 ? res.body().substring(0, 200) + "..." : res.body();
-            BeamQueueLog.warn("AI API non-200: model={} status={} body={}", modelName, res.statusCode(), bodyPreview);
+            BeamQueueLog.warn("AI API non-200: status={} body={}", res.statusCode(), bodyPreview);
             if (res.statusCode() == 404) {
                 BeamQueueLog.warn("AI API 404: wrong api_url or model. Check config/beamqueue.properties.");
             }
             return null;
         }
         return null;
+    }
+
+    private static String extractContentFromAnyShape(String body) {
+        if (body == null || body.isBlank()) return null;
+        // Some providers still return SSE-like chunks, others return plain JSON.
+        String sse = extractStreamedContent(body);
+        if (sse != null && !sse.isBlank()) return sse;
+        String jsonChoice = extractMessageContent(body);
+        if (jsonChoice != null && !jsonChoice.isBlank()) return jsonChoice;
+        String fallback = extractContent(body);
+        if (fallback != null && !fallback.isBlank()) return fallback;
+        return null;
+    }
+
+    private static boolean isRateLimitedNow() {
+        return System.currentTimeMillis() < rateLimitedUntilMs;
+    }
+
+    private static void markRateLimited(int backoffMs) {
+        long now = System.currentTimeMillis();
+        long next = now + Math.max(1000L, (long) backoffMs);
+        if (next > rateLimitedUntilMs) {
+            rateLimitedUntilMs = next;
+        }
     }
 
     private static void enforceApiGap() throws InterruptedException {
@@ -373,6 +403,31 @@ public final class BeamQueueAiReply {
         start += marker.length();
         StringBuilder out = new StringBuilder();
         for (int i = start; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (c == '\\' && i + 1 < json.length()) {
+                char next = json.charAt(i + 1);
+                if (next == '"') { out.append('"'); i++; continue; }
+                if (next == 'n') { out.append('\n'); i++; continue; }
+                if (next == '\\') { out.append('\\'); i++; continue; }
+            }
+            if (c == '"') break;
+            out.append(c);
+        }
+        return out.toString().trim();
+    }
+
+    /** Extract choices[0].message.content from standard non-stream chat completion JSON. */
+    private static String extractMessageContent(String json) {
+        if (json == null || json.isBlank()) return null;
+        int choicesIdx = json.indexOf("\"choices\"");
+        if (choicesIdx == -1) return null;
+        int messageIdx = json.indexOf("\"message\"", choicesIdx);
+        if (messageIdx == -1) return null;
+        int contentIdx = json.indexOf("\"content\":\"", messageIdx);
+        if (contentIdx == -1) return null;
+        contentIdx += "\"content\":\"".length();
+        StringBuilder out = new StringBuilder();
+        for (int i = contentIdx; i < json.length(); i++) {
             char c = json.charAt(i);
             if (c == '\\' && i + 1 < json.length()) {
                 char next = json.charAt(i + 1);

@@ -99,18 +99,18 @@ AI handles non-yes/non-decline target replies.
 - HUD status is shown in top-left
 - Health checks run automatically
 - Temporary API issues do not instantly flip to red status
+- Default AI endpoint is `https://g4f.space/api/auto/chat/completions`
+- AI requests are sent with no API key and no model by default
 
-### <u>API Key (Persistent)</u>
+### <u>API Key (Optional)</u>
 
 Command:
 
-- `/apikey <your-g4f-key>`
+- `/apikey <your-g4f-key>` (optional)
 
 Function:
 
-- Sets API key immediately for current session
-- Saves API key to `config/beamqueue.properties`
-- Reuses saved key on future launches
+- Saves key to `config/beamqueue.properties` if you still want to keep one configured
 - Triggers immediate AI health re-check
 
 Config/env options:
@@ -129,7 +129,7 @@ Config/env options:
 - `/changemode discord <value>` -> use Discord share mode
 - `/changeip <ip>` -> update stored IP without switching share mode
 - `/autoreconnect <on|off>` -> toggle reconnect mode
-- `/apikey <key>` -> set and persist API key
+- `/apikey <key>` -> optionally set and persist API key
 
 ## 🧠 Reply Logic
 

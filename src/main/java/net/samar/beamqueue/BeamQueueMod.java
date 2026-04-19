@@ -75,6 +75,7 @@ public class BeamQueueMod implements ClientModInitializer {
 
     private static long lastPrivateMsgAt = 0L;
     private static final long PRIVATE_MSG_GAP_MS = 3500L;
+    private static final String FLOWPVP_MATCH_TEXT = "you were matched for";
     private static final int FLOWPVP_CONTAINER_SLOT_INDEX = 10; // 0-based index as requested
     private static final int FLOWPVP_QUEUE_CLICK_RETRIES = 8;
     private static final long FLOWPVP_QUEUE_INITIAL_DELAY_MS = 3000L;
@@ -98,6 +99,8 @@ public class BeamQueueMod implements ClientModInitializer {
     private static final int MAX_SCAN_ATTEMPTS = 4;
     private static final double MAX_SQ_DISTANCE = 2500;
     private static final Pattern MINECRAFT_USERNAME_PATTERN = Pattern.compile("^[A-Za-z0-9_]{3,16}$");
+    private static boolean flowPvpAwaitingMatch = false;
+    private static int flowPvpMatchTick = -1;
 
     @Override
     public void onInitializeClient() {
@@ -347,6 +350,48 @@ public class BeamQueueMod implements ClientModInitializer {
                         return 1;
                     })
             );
+
+            dispatcher.register(
+                ClientCommandManager.literal("model")
+                    .then(ClientCommandManager.argument("name", StringArgumentType.greedyString()).executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        String modelName = sanitizeCommandValue(StringArgumentType.getString(ctx, "name"));
+                        if (modelName.isBlank()) {
+                            client.player.sendMessage(Text.literal("Usage: /model <model-name>").formatted(Formatting.GREEN), false);
+                            return 0;
+                        }
+                        boolean saved = BeamQueueConfig.setModel(modelName);
+                        BeamQueueAiReply.triggerHealthCheckNow();
+                        if (saved) {
+                            client.player.sendMessage(Text.literal("Model set to: " + BeamQueueConfig.getModel()).formatted(Formatting.GREEN), false);
+                        } else {
+                            client.player.sendMessage(Text.literal("Model set for now, but failed to save config file.").formatted(Formatting.GREEN), false);
+                        }
+                        BeamQueueLog.info("AI model updated via /model command: {}", modelName);
+                        return 1;
+                    }))
+                    .executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        client.player.sendMessage(Text.literal("Current model: " + BeamQueueConfig.getModel()).formatted(Formatting.GREEN), false);
+                        return 1;
+                    })
+            );
+
+            dispatcher.register(
+                ClientCommandManager.literal("checkai")
+                    .executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        BeamQueueAiReply.triggerHealthCheckNow();
+                        client.player.sendMessage(
+                            Text.literal("AI check triggered. Current status: " + BeamQueueAiReply.getHealthLabel())
+                                .formatted(Formatting.GREEN),
+                            false);
+                        return 1;
+                    })
+            );
         });
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
@@ -460,6 +505,7 @@ public class BeamQueueMod implements ClientModInitializer {
             if (ticksSinceStart >= TICKS_BEAM_TIMEOUT) {
                 client.player.sendMessage(Text.literal("Beam timed out. Restarting in 10s...").formatted(Formatting.GREEN), false);
                 setForwardPressed(client, false);
+                sendLeaveForCurrentServer(client);
                 targetPlayer = null;
                 tournamentSent = false;
                 timeoutRestartPending = true;
@@ -469,12 +515,20 @@ public class BeamQueueMod implements ClientModInitializer {
 
             if (targetPlayer == null) {
                 int moveTicks = getMoveTicksForServer();
-                int ticksBeforeFirstScan = TICKS_7_SEC + moveTicks;
+                int moveStartTick = TICKS_7_SEC;
+                if ("flowpvp".equalsIgnoreCase(beamServer)) {
+                    if (flowPvpMatchTick < 0) {
+                        setForwardPressed(client, false);
+                        return;
+                    }
+                    moveStartTick = flowPvpMatchTick;
+                }
+                int ticksBeforeFirstScan = moveStartTick + moveTicks;
                 int moveSeconds = moveTicks / 20;
-                if (ticksSinceStart == TICKS_7_SEC) {
+                if (ticksSinceStart == moveStartTick) {
                     client.player.sendMessage(Text.literal("Moving forward for " + moveSeconds + "s...").formatted(Formatting.GREEN), false);
                 }
-                if (ticksSinceStart >= TICKS_7_SEC && ticksSinceStart < ticksBeforeFirstScan) {
+                if (ticksSinceStart >= moveStartTick && ticksSinceStart < ticksBeforeFirstScan) {
                     setForwardPressed(client, true);
                 } else if (ticksSinceStart == ticksBeforeFirstScan) {
                     setForwardPressed(client, false);
@@ -514,6 +568,7 @@ public class BeamQueueMod implements ClientModInitializer {
 
                 if (client.player != null) {
                     String plain = stripFormatting(message.getString());
+                    maybeHandleFlowPvpMatchDetected(client, plain);
                     String ourName = client.player.getName().getString();
                     if (isOurDeathMessage(plain, ourName)) {
                         deathMessageSeen = true;
@@ -593,6 +648,7 @@ public class BeamQueueMod implements ClientModInitializer {
 
                 if (client.player != null) {
                     String plain = stripFormatting(message.getString());
+                    maybeHandleFlowPvpMatchDetected(client, plain);
                     String ourName = client.player.getName().getString();
                     if (isOurDeathMessage(plain, ourName)) {
                         deathMessageSeen = true;
@@ -676,12 +732,22 @@ public class BeamQueueMod implements ClientModInitializer {
             if (autoReconnectEnabled) {
                 pendingAutoReconnect = true;
                 autoReconnectWaitTicks = 0;
-                captureCurrentServer(client);
                 captureServerFromHandler(handler);
+                captureCurrentServer(client);
                 BeamQueueLog.info("Disconnected -> scheduling auto reconnect in {}s", (TICKS_AUTO_RECONNECT_DELAY / 20));
                 return;
             }
             reset();
+        });
+
+        ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
+            captureServerFromHandler(handler);
+            captureCurrentServer(client);
+            pendingAutoReconnect = false;
+            autoReconnectWaitTicks = 0;
+            if (lastServerAddress != null && !lastServerAddress.isBlank()) {
+                BeamQueueLog.info("Connected -> remembered server {}", lastServerAddress);
+            }
         });
 
         HudRenderCallback.EVENT.register((drawContext, tickCounter) -> {
@@ -823,6 +889,8 @@ public class BeamQueueMod implements ClientModInitializer {
         timeoutRestartTicks = 0;
         introReplyWaitActive = false;
         introReplyWaitTicks = 0;
+        flowPvpAwaitingMatch = false;
+        flowPvpMatchTick = -1;
         startBeamEntryAction(client);
     }
 
@@ -849,13 +917,17 @@ public class BeamQueueMod implements ClientModInitializer {
                 client.interactionManager.interactItem(client.player, Hand.MAIN_HAND);
             }
             scheduleFlowPvpQueueClick(FLOWPVP_QUEUE_CLICK_RETRIES, FLOWPVP_QUEUE_INITIAL_DELAY_MS);
+            flowPvpAwaitingMatch = true;
+            flowPvpMatchTick = -1;
             client.player.sendMessage(
-                Text.literal("FlowPvP mode: selected slot 2, right-clicked, waiting 3s, then queue slot 10. Waiting 7s, then moving forward " + moveSeconds + "s, then scanning...")
+                Text.literal("FlowPvP mode: selected slot 2, right-clicked, waiting 3s, then queue slot 10. Waiting for match message, then moving forward " + moveSeconds + "s, then scanning...")
                     .formatted(Formatting.GREEN),
                 false);
             BeamQueueLog.info("/beam start action: flowpvp (slot2 + right-click + container slot10)");
             return;
         }
+        flowPvpAwaitingMatch = false;
+        flowPvpMatchTick = -1;
         client.player.networkHandler.sendChatCommand("queue " + queueMode);
         client.player.sendMessage(
             Text.literal("Queued " + queueMode + "! Waiting 7s, then moving forward " + moveSeconds + "s, then scanning...").formatted(Formatting.GREEN),
@@ -940,7 +1012,6 @@ public class BeamQueueMod implements ClientModInitializer {
 
     private static void captureServerFromHandler(Object handler) {
         if (handler == null) return;
-        if (lastServerAddress != null && !lastServerAddress.isBlank()) return;
         try {
             Method getConnection = handler.getClass().getMethod("getConnection");
             Object connection = getConnection.invoke(handler);
@@ -1018,7 +1089,23 @@ public class BeamQueueMod implements ClientModInitializer {
         timeoutRestartTicks = 0;
         introReplyWaitActive = false;
         introReplyWaitTicks = 0;
+        flowPvpAwaitingMatch = false;
+        flowPvpMatchTick = -1;
         lastProcessedMessageKey = null;
+    }
+
+    private static void maybeHandleFlowPvpMatchDetected(MinecraftClient client, String plainMessage) {
+        if (client == null || client.player == null) return;
+        if (!active || !"flowpvp".equalsIgnoreCase(beamServer)) return;
+        if (!flowPvpAwaitingMatch || flowPvpMatchTick >= 0) return;
+        if (plainMessage == null) return;
+        String lower = plainMessage.toLowerCase();
+        if (!lower.contains(FLOWPVP_MATCH_TEXT)) return;
+
+        flowPvpMatchTick = ticksSinceStart;
+        flowPvpAwaitingMatch = false;
+        BeamQueueLog.info("FlowPvP match detected at tick {} -> starting movement phase", flowPvpMatchTick);
+        client.player.sendMessage(Text.literal("FlowPvP match found. Starting movement now...").formatted(Formatting.GREEN), false);
     }
 
     private static int parseQueueCooldownSeconds(String message) {

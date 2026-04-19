@@ -9,7 +9,7 @@ import java.util.Properties;
 
 /**
  * Loads API key and base URL from config/beamqueue.properties or env.
- * Defaults to g4f.dev Groq endpoint (no key required): https://g4f.dev/api/groq/chat/completions
+ * Default API URL: https://g4f.space/api/auto/chat/completions
  * Env: BEAMQUEUE_API_KEY or BEAMQUEUE_OPENAI_API_KEY.
  */
 public final class BeamQueueConfig {
@@ -22,8 +22,10 @@ public final class BeamQueueConfig {
     private static final String KEY_OPENAI_API_URL = "openai_api_url";
     private static final String KEY_MODEL = "model";
     private static final String KEY_DEBUG = "debug";
-    /** g4f.space OpenAI-compatible endpoint. */
-    private static final String DEFAULT_API_URL = "https://g4f.space/api/v1/chat/completions";
+    /** g4f.space auto provider endpoint. */
+    private static final String DEFAULT_API_URL = "https://g4f.space/api/auto/chat/completions";
+    /** Empty by default so provider auto-selects model unless user sets one. */
+    private static final String DEFAULT_MODEL = "";
     /** Hardcoded g4f.dev API key (override with config or env if needed). */
     private static final String HARDCODED_API_KEY = "g4f_u_mm3dtj_731391ec3875d2f03e5e6ed43c2feb0d48b099df8eaa9de2_6a6aaef4";
 
@@ -45,7 +47,7 @@ public final class BeamQueueConfig {
     /** AI model name. Empty by default so provider can auto-select. Config key: model */
     public static String getModel() {
         ensureLoaded();
-        return (model != null && !model.isBlank()) ? model : "";
+        return (model != null && !model.isBlank()) ? model : DEFAULT_MODEL;
     }
 
     public static boolean hasApiKey() {
@@ -59,6 +61,14 @@ public final class BeamQueueConfig {
         ensureLoaded();
         apiKey = normalized;
         return saveApiKeyToConfig(normalized);
+    }
+
+    public static synchronized boolean setModel(String newModel) {
+        String normalized = newModel == null ? "" : newModel.trim();
+        if (normalized.isBlank()) return false;
+        ensureLoaded();
+        model = normalized;
+        return saveModelToConfig(normalized);
     }
 
     private static void ensureLoaded() {
@@ -111,6 +121,29 @@ public final class BeamQueueConfig {
             return true;
         } catch (IOException e) {
             BeamQueueLog.warn("Failed writing API key to config: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    private static boolean saveModelToConfig(String modelName) {
+        Path configPath = getConfigPath();
+        Properties p = new Properties();
+        if (Files.isRegularFile(configPath)) {
+            try (var in = Files.newInputStream(configPath)) {
+                p.load(in);
+            } catch (IOException e) {
+                BeamQueueLog.warn("Failed reading existing config before writing model: {}", e.getMessage());
+            }
+        }
+        p.setProperty(KEY_MODEL, modelName);
+        try {
+            Files.createDirectories(configPath.getParent());
+            try (var out = Files.newOutputStream(configPath)) {
+                p.store(out, "Beam Queue config");
+            }
+            return true;
+        } catch (IOException e) {
+            BeamQueueLog.warn("Failed writing model to config: {}", e.getMessage());
             return false;
         }
     }

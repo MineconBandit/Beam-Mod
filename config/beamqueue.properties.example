@@ -2,11 +2,11 @@
 # Copy to <game-dir>/config/beamqueue.properties and set your key.
 # Or set env BEAMQUEUE_API_KEY or BEAMQUEUE_OPENAI_API_KEY.
 
-# Groq API: g4f.space works from mod; g4f.dev may return 405 for server-side requests.
-api_url=https://g4f.space/api/groq/v1/chat/completions
+# g4f API endpoint used by default in code.
+api_url=https://g4f.space/api/auto/chat/completions
 api_key=your-g4f-api-key-here
-# Default: Llama 4 Maverick. Override if needed.
-# model=meta-llama/llama-4-maverick-17b-128e-instruct
+# Default model in code is empty (provider auto-select). Optional:
+# model=
 
 # Debug: set to true for verbose logs (prefix matching, tick phase, scan, AI) in latest.log
 # Or set env BEAMQUEUE_DEBUG=true
