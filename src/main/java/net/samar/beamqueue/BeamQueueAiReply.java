@@ -670,6 +670,8 @@ public final class BeamQueueAiReply {
     private static String buildSystemPrompt() {
         String shareTarget = BeamQueueMod.getShareTargetMasked();
         String modeLabel = BeamQueueMod.isShareModeDiscord() ? "discord invite" : "server ip";
+        String intro1 = BeamQueueMod.getIntroMsg1();
+        String intro2 = BeamQueueMod.getIntroMsg2();
         return "You are trying to get the player to join via this " + modeLabel + ": " + shareTarget + ". " +
             "All chat conversation from that player is forwarded to you. " +
             "Classify intent and provide a short reply in this exact format: INTENT=<INTERESTED|DECLINED|UNSURE>; REPLY=<text>. " +
@@ -699,7 +701,7 @@ public final class BeamQueueAiReply {
             "If unsure -> reply vaguely like idk tbh. " +
             "The whole conversation between you (AI) and the player is sent to you, so reply naturally. " +
             "Do not repeat the same phrases. " +
-            "Two messages are hardcoded and sent before AI chat starts: 'hi' and 'theres a 2v2 pvp tournament wanna join?'. " +
+            "Two messages are sent before AI chat starts: '" + intro1 + "' and '" + intro2 + "'. " +
             "Use those as context to keep replies natural. " +
             "Avoid being overly helpful or overly consistent; act like a normal player.";
     }

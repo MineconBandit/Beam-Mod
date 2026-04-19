@@ -66,6 +66,8 @@ public class BeamQueueMod implements ClientModInitializer {
     private static String shareMode = "ip";
     private static String serverIpPlain = "mc-feather.com";
     private static String discordInvitePlain = "discord.gg/fnw";
+    private static String introMsg1 = "hi";
+    private static String introMsg2 = "theres a 2v2 sword pvp tournament wanna join?";
     private static boolean autoReconnectEnabled = true;
     private static boolean pendingAutoReconnect = false;
     private static int autoReconnectWaitTicks = 0;
@@ -260,6 +262,38 @@ public class BeamQueueMod implements ClientModInitializer {
                         MinecraftClient client = MinecraftClient.getInstance();
                         if (client.player == null) return 0;
                         client.player.sendMessage(Text.literal("Current server IP: " + getServerIpMasked()).formatted(Formatting.GREEN), false);
+                        return 1;
+                    })
+            );
+
+            dispatcher.register(
+                ClientCommandManager.literal("intromsg")
+                    .then(ClientCommandManager.argument("msg1", StringArgumentType.string())
+                        .then(ClientCommandManager.argument("msg2", StringArgumentType.string()).executes(ctx -> {
+                            MinecraftClient client = MinecraftClient.getInstance();
+                            if (client.player == null) return 0;
+                            String msg1 = sanitizeCommandValue(StringArgumentType.getString(ctx, "msg1"));
+                            String msg2 = sanitizeCommandValue(StringArgumentType.getString(ctx, "msg2"));
+                            if (msg1.isBlank() || msg2.isBlank()) {
+                                client.player.sendMessage(Text.literal("Usage: /intromsg \"<msg 1>\" \"<msg 2>\"").formatted(Formatting.GREEN), false);
+                                return 0;
+                            }
+                            introMsg1 = msg1;
+                            introMsg2 = msg2;
+                            client.player.sendMessage(
+                                Text.literal("Intro messages updated. msg1=\"" + introMsg1 + "\" msg2=\"" + introMsg2 + "\"")
+                                    .formatted(Formatting.GREEN),
+                                false);
+                            BeamQueueLog.info("Intro messages updated via /intromsg: msg1=\"{}\" msg2=\"{}\"", introMsg1, introMsg2);
+                            return 1;
+                        })))
+                    .executes(ctx -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client.player == null) return 0;
+                        client.player.sendMessage(
+                            Text.literal("Current intro messages: msg1=\"" + introMsg1 + "\" msg2=\"" + introMsg2 + "\". Usage: /intromsg \"<msg 1>\" \"<msg 2>\"")
+                                .formatted(Formatting.GREEN),
+                            false);
                         return 1;
                     })
             );
@@ -579,7 +613,7 @@ public class BeamQueueMod implements ClientModInitializer {
 
             if (!tournamentSent && ticksSinceStart >= targetSetTick + TICKS_TARGET_FOLLOWUP_DELAY) {
                 tournamentSent = true;
-                client.player.networkHandler.sendChatCommand("msg " + targetPlayer + " theres a 2v2 sword pvp tournament wanna join?");
+                client.player.networkHandler.sendChatCommand("msg " + targetPlayer + " " + introMsg2);
                 client.player.sendMessage(Text.literal("Sent invite to " + targetPlayer + "!").formatted(Formatting.GREEN), false);
                 BeamQueueLog.info("Sent tournament invite to target={}", targetPlayer);
                 introReplyWaitActive = true;
@@ -837,8 +871,8 @@ public class BeamQueueMod implements ClientModInitializer {
         introReplyWaitTicks = 0;
 
         self.sendMessage(Text.literal("Found " + targetPlayer + "! Messaging...").formatted(Formatting.GREEN), false);
-        self.networkHandler.sendChatCommand("msg " + targetPlayer + " hi");
-        self.sendMessage(Text.literal("Messaged " + targetPlayer + ": hi").formatted(Formatting.GREEN), false);
+        self.networkHandler.sendChatCommand("msg " + targetPlayer + " " + introMsg1);
+        self.sendMessage(Text.literal("Messaged " + targetPlayer + ": " + introMsg1).formatted(Formatting.GREEN), false);
     }
 
     private static void setForwardPressed(MinecraftClient client, boolean pressed) {
@@ -1282,6 +1316,14 @@ public class BeamQueueMod implements ClientModInitializer {
 
     public static String getShareTargetMasked() {
         return isShareModeDiscord() ? getDiscordInviteMasked() : getServerIpMasked();
+    }
+
+    public static String getIntroMsg1() {
+        return sanitizeCommandValue(introMsg1);
+    }
+
+    public static String getIntroMsg2() {
+        return sanitizeCommandValue(introMsg2);
     }
 
     private static String buildJoinFollowupMessage() {
